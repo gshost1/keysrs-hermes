@@ -1,0 +1,15 @@
+name: keysrs
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+description: >-
+  Keysrs secret source: Hermes calls providers through the local Keysrs
+  gateway with a scoped, expiring client token, so the real API key never
+  enters Hermes.
+author: George Shostakovich
+license: MIT
+homepage: https://github.com/gshost1/keysrs-hermes
+tags: [secrets, macos, keychain, gateway]
+requires_hermes: ">=0.20.4"
+provides_tools: []
+provides_hooks: []

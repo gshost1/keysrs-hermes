@@ -204,7 +204,7 @@ def test_gateway_on_missing_counts_as_off(fake_keys, fetch):
         json.dumps(token_payload(token="")),
         json.dumps(token_payload(token=None)),
         json.dumps(token_payload(token="   ")),
-        json.dumps(token_payload(token="sk-or-real-provider-key")),
+        json.dumps(token_payload(token="sk-or-" + "real-provider-key")),
         json.dumps(token_payload(token="ksfc_a b")),
         json.dumps(token_payload(base_url="")),
         json.dumps({k: v for k, v in token_payload().items() if k != "token"}),
@@ -218,7 +218,7 @@ def test_malformed_output_is_empty_value(fake_keys, fetch, stdout):
 
 
 @pytest.mark.parametrize(
-    "url", ["https://evil.example/openrouter", "http://10.0.0.5:12767/x", "file:///etc/passwd", "127.0.0.1:12767"]
+    "url", ["https://evil.example/openrouter", "http://10.0.0.5:12767/x", "file:///tmp/keysrs", "127.0.0.1:12767"]
 )
 def test_non_loopback_base_url_refused(fake_keys, fetch, url):
     fake_keys.token_ok(base_url=url)

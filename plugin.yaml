@@ -7,7 +7,7 @@ description: >-
   enters Hermes.
 author: George Shostakovich
 license: MIT
-homepage: https://github.com/gshost1/keysrs-hermes
+homepage: https://keysrs.com
 tags: [secrets, macos, keychain, gateway]
 requires_hermes: ">=0.20.4"
 provides_tools: []

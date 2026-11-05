@@ -13,7 +13,7 @@ import pytest
 
 from agent.secret_sources.registry import _reset_registry_for_tests, apply_all, register_source
 
-from conftest import TOKEN, token_payload
+from conftest import BASE_URL, TOKEN, provider_cfg, token_payload, yaml_dump
 import keysrs_hermes.cli as cli
 from keysrs_hermes.keysrs_source import KeysrsSource, lookup_token
 
@@ -43,12 +43,12 @@ def _strings(result, src, cfg):
 
 
 @pytest.mark.parametrize("name", sorted(SCENARIOS))
-def test_fetch_never_exposes_token(fake_keys, caplog, name):
+def test_fetch_never_exposes_token(fake_keys, hermes_home, caplog, name):
     caplog.set_level(logging.DEBUG)
     fake_keys.set("token", **SCENARIOS[name])
     src = KeysrsSource()
     cfg = {"enabled": True, "key": "openrouter"}
-    result = src.fetch(cfg, Path("/nonexistent"))
+    result = src.fetch(cfg, hermes_home)
     for text in _strings(result, src, cfg):
         assert TOKEN not in text, f"{name}: {text}"
     assert TOKEN not in caplog.text
@@ -65,7 +65,8 @@ def test_fetch_never_exposes_token(fake_keys, caplog, name):
 def test_status_never_prints_token(fake_keys, monkeypatch, capsys, caplog, name):
     caplog.set_level(logging.DEBUG)
     monkeypatch.setattr(
-        cli, "_load_config", lambda: {"secrets": {"keysrs": {"enabled": True, "key": "openrouter"}}}
+        cli, "_load_config",
+        lambda: {"secrets": {"keysrs": {"enabled": True, "key": "openrouter"}}, **provider_cfg()},
     )
     fake_keys.set("token", **SCENARIOS[name])
     parser = argparse.ArgumentParser()
@@ -77,14 +78,22 @@ def test_status_never_prints_token(fake_keys, monkeypatch, capsys, caplog, name)
     assert TOKEN not in caplog.text
 
 
-def test_setup_never_prints_or_stores_token(fake_keys, monkeypatch, capsys, caplog):
+def test_setup_never_prints_or_stores_token(fake_keys, tmp_path, monkeypatch, capsys, caplog):
     caplog.set_level(logging.DEBUG)
     saved = {}
+    home = tmp_path / "h"
+    home.mkdir()
+
+    def save(cfg):
+        saved.update(cfg)
+        (home / "config.yaml").write_text(yaml_dump(cfg))
+
     monkeypatch.setattr(cli, "_load_config", lambda: {})
-    monkeypatch.setattr(cli, "_save_config", lambda cfg: saved.update(cfg))
+    monkeypatch.setattr(cli, "_save_config", save)
+    monkeypatch.setattr(cli, "_hermes_home", lambda: home)
     fake_keys.set(
         "issue",
-        stdout=json.dumps({"held": True, "key": "openrouter", "label": "hermes",
+        stdout=json.dumps({"held": True, "key": "openrouter", "label": "hermes", "base_url": BASE_URL,
                            "expires_at": "2099-01-01T00:00:00Z", "token": TOKEN}),
     )
     fake_keys.token_ok()
@@ -95,10 +104,11 @@ def test_setup_never_prints_or_stores_token(fake_keys, monkeypatch, capsys, capl
     captured = capsys.readouterr()
     assert TOKEN not in captured.out + captured.err + caplog.text
     assert TOKEN not in json.dumps(saved)
+    assert TOKEN not in (home / "config.yaml").read_text()
 
 
 @pytest.mark.parametrize("name", sorted(SCENARIOS))
-def test_orchestrator_report_never_shows_token(fake_keys, monkeypatch, caplog, name):
+def test_orchestrator_report_never_shows_token(fake_keys, hermes_home, monkeypatch, caplog, name):
     """A full Hermes apply_all() pass: the token lands in the env mapping only."""
     caplog.set_level(logging.DEBUG)
     fake_keys.set("token", **SCENARIOS[name])
@@ -106,17 +116,18 @@ def test_orchestrator_report_never_shows_token(fake_keys, monkeypatch, caplog, n
     monkeypatch.setattr("agent.secret_sources.registry._ensure_builtin_sources", lambda: None)
     try:
         assert register_source(KeysrsSource())
-        env = {"OPENROUTER_API_KEY": "sk-or-real-in-dotfile"}
-        report = apply_all({"keysrs": {"enabled": True}}, Path("/nonexistent"), environ=env)
+        env = {"OPENROUTER_API_KEY": "sk-or-real-in-dotfile", "KEYSRS_TOKEN": "ksfc_stale"}
+        report = apply_all({"keysrs": {"enabled": True}}, hermes_home, environ=env)
         (sr,) = report.sources
         assert TOKEN not in repr(sr.result)
         assert TOKEN not in str(report.conflicts) + str(sr.result.error) + str(sr.result.warnings)
         assert TOKEN not in caplog.text
+        # The vendor key is never touched; only KEYSRS_TOKEN changes.
+        assert env["OPENROUTER_API_KEY"] == "sk-or-real-in-dotfile"
+        assert set(env) == {"OPENROUTER_API_KEY", "KEYSRS_TOKEN"}
         if sr.result.ok:
-            # override_existing defaults on: a stale real key does not survive
-            assert env["OPENROUTER_API_KEY"] == TOKEN
-            assert env["OPENROUTER_BASE_URL"] == "http://127.0.0.1:12767/openrouter"
+            assert env["KEYSRS_TOKEN"] == TOKEN  # override_existing default replaces a stale token
         else:
-            assert env == {"OPENROUTER_API_KEY": "sk-or-real-in-dotfile"}
+            assert env["KEYSRS_TOKEN"] == "ksfc_stale"
     finally:
         _reset_registry_for_tests()

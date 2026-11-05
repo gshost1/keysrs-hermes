@@ -31,6 +31,33 @@ TOKEN = "ksfc_TESTTOKEN_c0ffee1234567890abcdef"
 BASE_URL = "http://127.0.0.1:12767/openrouter"
 
 
+def provider_cfg(**overrides):
+    entry = {"base_url": BASE_URL, "key_env": "KEYSRS_TOKEN", "api_mode": "chat_completions"}
+    entry.update(overrides)
+    return {"providers": {"keysrs": entry}}
+
+
+def yaml_dump(data) -> str:
+    """PyYAML on Hermes 0.20.x, ruamel.yaml on 0.22.x (whichever Hermes ships)."""
+    try:
+        import yaml
+    except ImportError:
+        import io
+
+        from ruamel.yaml import YAML
+
+        buf = io.StringIO()
+        YAML(typ="safe", pure=True).dump(data, buf)
+        return buf.getvalue()
+    return yaml.safe_dump(data)
+
+
+def write_config(home: Path, cfg: dict) -> Path:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(yaml_dump(cfg))
+    return home
+
+
 def token_payload(**overrides):
     payload = {
         "base_url": BASE_URL,
@@ -85,3 +112,9 @@ def fake_keys(tmp_path, monkeypatch):
 
     assert shutil.which("keys") == str(fk.path)
     return fk
+
+
+@pytest.fixture
+def hermes_home(tmp_path):
+    """A profile dir whose config.yaml has the standard keysrs provider entry."""
+    return write_config(tmp_path / "hermes", provider_cfg())

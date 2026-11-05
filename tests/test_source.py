@@ -1,84 +1,115 @@
-"""fetch() outcomes for every `keys client token` result."""
+"""fetch() outcomes for every `keys client token` result and provider-entry state."""
 
 from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 
 import pytest
 
 from agent.secret_sources.base import ErrorKind, FetchResult
 
-from conftest import BASE_URL, TOKEN, token_payload
-from keysrs_hermes.keysrs_source import KeysrsSource, is_loopback_http_url
+from conftest import BASE_URL, TOKEN, provider_cfg, token_payload, write_config
+from keysrs_hermes.keysrs_source import KeysrsSource, is_loopback_http_url, valid_key_env
 
 CFG = {"enabled": True}
 
 
-def fetch(cfg=None):
-    return KeysrsSource().fetch(dict(CFG, **(cfg or {})), Path("/nonexistent-hermes-home"))
+@pytest.fixture
+def fetch(hermes_home):
+    def _fetch(cfg=None, home=None):
+        return KeysrsSource().fetch(dict(CFG, **(cfg or {})), home or hermes_home)
+    return _fetch
 
 
-def test_success_fills_openrouter_vars(fake_keys):
+def test_success_fills_only_the_keysrs_var(fake_keys, fetch):
     fake_keys.token_ok()
     result = fetch()
     assert result.ok, result.error
-    assert result.secrets == {"OPENROUTER_BASE_URL": BASE_URL, "OPENROUTER_API_KEY": TOKEN}
+    assert result.secrets == {"KEYSRS_TOKEN": TOKEN}
     assert result.binary_path == fake_keys.path
     assert result.warnings == []
 
 
-def test_argv_is_client_token_with_label(fake_keys):
+def test_never_fills_vendor_vars(fake_keys, fetch):
+    fake_keys.token_ok()
+    names = set(fetch().secrets)
+    assert all(n.startswith("KEYSRS_") for n in names)
+    assert not names & {"OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+                        "OPENROUTER_BASE_URL", "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL"}
+
+
+def test_argv_is_client_token_with_label(fake_keys, fetch):
     fake_keys.token_ok()
     fetch({"label": "work"})
     (call,) = fake_keys.calls()
     assert call["argv"] == ["client", "token", "--label", "work", "--json"]
 
 
-def test_openai_preset(fake_keys):
-    fake_keys.token_ok(base_url="http://127.0.0.1:12767/openai")
-    result = fetch({"provider": "openai"})
-    assert result.secrets == {
-        "OPENAI_BASE_URL": "http://127.0.0.1:12767/openai",
-        "OPENAI_API_KEY": TOKEN,
-    }
-
-
-def test_env_override_map(fake_keys):
+def test_custom_provider_name_and_key_env(fake_keys, tmp_path, fetch):
+    home = write_config(tmp_path / "h2", {"providers": {"gw": {
+        "base_url": BASE_URL + "/", "api_key_env": "KEYSRS_WORK"}}})
     fake_keys.token_ok()
-    result = fetch({"provider": "custom", "env": {"base_url": "MY_URL", "api_key": "MY_KEY"}})
-    assert result.secrets == {"MY_URL": BASE_URL, "MY_KEY": TOKEN}
+    result = fetch({"provider_name": "gw", "key_env": "KEYSRS_WORK"}, home=home)
+    assert result.secrets == {"KEYSRS_WORK": TOKEN}
 
 
-def test_env_override_key_only(fake_keys):
-    fake_keys.token_ok()
-    result = fetch({"env": {"base_url": "", "api_key": "OPENROUTER_API_KEY"}})
-    assert result.secrets == {"OPENROUTER_API_KEY": TOKEN}
+@pytest.mark.parametrize("key_env", ["OPENROUTER_API_KEY", "OPENAI_API_KEY", "KEYSRS_", "keysrs_token",
+                                     "KEYSRS TOKEN", "MY_KEY"])
+def test_key_env_must_be_keysrs_prefixed(fake_keys, fetch, key_env):
+    assert not valid_key_env(key_env)
+    result = fetch({"key_env": key_env})
+    assert result.error_kind == ErrorKind.REF_INVALID
+    assert not result.secrets and fake_keys.calls() == []
 
 
-@pytest.mark.parametrize(
-    "cfg",
-    [
-        {"provider": "nope"},
-        {"provider": "custom"},
-        {"env": "not-a-dict"},
-        {"env": {"api_key": "bad name"}},
-        {"env": {"base_url": "SAME", "api_key": "SAME"}},
-        {"label": "--evil"},
-        {"label": "has space"},
-    ],
-)
-def test_bad_config_is_ref_invalid_and_runs_nothing(fake_keys, cfg):
+@pytest.mark.parametrize("cfg", [{"label": "--evil"}, {"label": "has space"}, {"provider_name": "Bad Name"},
+                                 {"provider_name": "-x"}])
+def test_bad_names_are_ref_invalid_and_run_nothing(fake_keys, fetch, cfg):
     result = fetch(cfg)
     assert result.error_kind == ErrorKind.REF_INVALID
+    assert not result.secrets and fake_keys.calls() == []
+
+
+@pytest.mark.parametrize("hermes_cfg,needle", [
+    ({}, "missing"),
+    ({"providers": {"other": {"base_url": BASE_URL, "key_env": "KEYSRS_TOKEN"}}}, "missing"),
+    (provider_cfg(key_env="OPENROUTER_API_KEY"), "key_env"),
+    (provider_cfg(base_url=""), "no base_url"),
+    (provider_cfg(base_url="https://openrouter.ai/api/v1"), "not the local Keysrs gateway"),
+])
+def test_provider_entry_problems_are_not_configured(fake_keys, tmp_path, fetch, hermes_cfg, needle):
+    home = write_config(tmp_path / "h3", hermes_cfg)
+    fake_keys.token_ok()
+    result = fetch(home=home)
+    assert result.error_kind == ErrorKind.NOT_CONFIGURED
+    assert needle in result.error
     assert not result.secrets
-    assert fake_keys.calls() == []
+    assert fake_keys.calls() == []  # checked before asking keys for the token
 
 
-def test_trailing_slash_trimmed(fake_keys):
+def test_no_config_file(fake_keys, tmp_path, fetch):
+    assert fetch(home=tmp_path / "nowhere").error_kind == ErrorKind.NOT_CONFIGURED
+
+
+def test_unparseable_config(fake_keys, tmp_path, fetch):
+    (tmp_path / "bad").mkdir()
+    (tmp_path / "bad" / "config.yaml").write_text("providers: [unclosed")
+    assert fetch(home=tmp_path / "bad").error_kind == ErrorKind.NOT_CONFIGURED
+
+
+def test_base_url_mismatch_is_not_configured(fake_keys, fetch):
+    fake_keys.token_ok(base_url="http://127.0.0.1:12767/openai")
+    result = fetch()
+    assert result.error_kind == ErrorKind.NOT_CONFIGURED
+    assert "different gateway URL" in result.error
+    assert not result.secrets
+    assert "rerun" in KeysrsSource().remediation(result.error_kind, {}).lower()
+
+
+def test_trailing_slash_is_not_a_mismatch(fake_keys, fetch):
     fake_keys.token_ok(base_url=BASE_URL + "/")
-    assert fetch().secrets["OPENROUTER_BASE_URL"] == BASE_URL
+    assert fetch().ok
 
 
 @pytest.mark.parametrize(
@@ -90,46 +121,45 @@ def test_trailing_slash_trimmed(fake_keys):
         ("something_new", ErrorKind.NOT_CONFIGURED),
     ],
 )
-def test_exit_2(fake_keys, reason, kind):
+def test_exit_2(fake_keys, fetch, reason, kind):
     fake_keys.set("token", exit=2, stdout=json.dumps({"error": reason, "label": "hermes"}) + "\n")
     result = fetch()
     assert result.error_kind == kind
     assert not result.secrets
 
 
-def test_exit_2_without_json(fake_keys):
+def test_exit_2_without_json(fake_keys, fetch):
     fake_keys.set("token", exit=2, stdout="garbage")
     assert fetch().error_kind == ErrorKind.NOT_CONFIGURED
 
 
-def test_exit_6_app_not_running(fake_keys):
+def test_exit_6_app_not_running(fake_keys, fetch):
     fake_keys.set("token", exit=6, stderr="Keysrs is not running\n")
     result = fetch()
     assert result.error_kind == ErrorKind.NETWORK
     assert "not running" in result.error
 
 
-def test_exit_64_bad_args(fake_keys):
+def test_exit_64_bad_args(fake_keys, fetch):
     fake_keys.set("token", exit=64, stderr="unknown subcommand: client\n")
     result = fetch()
     assert result.error_kind == ErrorKind.INTERNAL
-    assert "exit 64" in result.error
-    assert "unknown subcommand" in result.error
+    assert "exit 64" in result.error and "unknown subcommand" in result.error
 
 
-def test_exit_1_other(fake_keys):
+def test_exit_1_other(fake_keys, fetch):
     fake_keys.set("token", exit=1, stderr="\x1b[31mboom\x1b[0m\n")
     result = fetch()
     assert result.error_kind == ErrorKind.INTERNAL
     assert "boom" in result.error and "\x1b" not in result.error
 
 
-def test_unexpected_exit_code(fake_keys):
+def test_unexpected_exit_code(fake_keys, fetch):
     fake_keys.set("token", exit=3)
     assert fetch().error_kind == ErrorKind.INTERNAL
 
 
-def test_gateway_off(fake_keys):
+def test_gateway_off(fake_keys, fetch):
     fake_keys.token_ok(gateway_on=False)
     result = fetch()
     assert result.error_kind == ErrorKind.AUTH_EXPIRED
@@ -137,7 +167,7 @@ def test_gateway_off(fake_keys):
     assert not result.secrets
 
 
-def test_gateway_on_missing_counts_as_off(fake_keys):
+def test_gateway_on_missing_counts_as_off(fake_keys, fetch):
     payload = token_payload()
     del payload["gateway_on"]
     fake_keys.set("token", stdout=json.dumps(payload))
@@ -160,7 +190,7 @@ def test_gateway_on_missing_counts_as_off(fake_keys):
         json.dumps({k: v for k, v in token_payload().items() if k != "token"}),
     ],
 )
-def test_malformed_output_is_empty_value(fake_keys, stdout):
+def test_malformed_output_is_empty_value(fake_keys, fetch, stdout):
     fake_keys.set("token", stdout=stdout)
     result = fetch()
     assert result.error_kind == ErrorKind.EMPTY_VALUE, result.error
@@ -170,7 +200,7 @@ def test_malformed_output_is_empty_value(fake_keys, stdout):
 @pytest.mark.parametrize(
     "url", ["https://evil.example/openrouter", "http://10.0.0.5:12767/x", "file:///etc/passwd", "127.0.0.1:12767"]
 )
-def test_non_loopback_base_url_refused(fake_keys, url):
+def test_non_loopback_base_url_refused(fake_keys, fetch, url):
     fake_keys.token_ok(base_url=url)
     result = fetch()
     assert result.error_kind == ErrorKind.INTERNAL
@@ -183,14 +213,15 @@ def test_loopback_check():
     assert is_loopback_http_url("http://[::1]:12767/x")
     assert not is_loopback_http_url("http://127.0.0.1.evil.example/x")
     assert not is_loopback_http_url("http://localhost.evil.example/x")
+    assert not is_loopback_http_url("http://127.0.0.1@evil.example/x")
 
 
-def test_expired_by_timestamp(fake_keys):
+def test_expired_by_timestamp(fake_keys, fetch):
     fake_keys.token_ok(expires_at="2000-01-01T00:00:00Z")
     assert fetch().error_kind == ErrorKind.AUTH_EXPIRED
 
 
-def test_expiring_soon_warns(fake_keys):
+def test_expiring_soon_warns(fake_keys, fetch):
     import datetime as dt
 
     soon = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -200,36 +231,35 @@ def test_expiring_soon_warns(fake_keys):
     assert any("expires in about" in w for w in result.warnings)
 
 
-def test_unreadable_expiry_warns_but_works(fake_keys):
+def test_unreadable_expiry_warns_but_works(fake_keys, fetch):
     fake_keys.token_ok(expires_at="whenever")
     result = fetch()
     assert result.ok
     assert any("expires_at" in w for w in result.warnings)
 
 
-def test_timeout(fake_keys):
+def test_timeout(fake_keys, fetch):
     fake_keys.set("token", sleep=5, stdout=json.dumps(token_payload()))
     result = fetch({"helper_timeout_seconds": 0.5})
     assert result.error_kind == ErrorKind.TIMEOUT
     assert not result.secrets
 
 
-def test_binary_missing_explicit_path(fake_keys, tmp_path):
-    result = fetch({"keys_path": str(tmp_path / "no-such-keys")})
-    assert result.error_kind == ErrorKind.BINARY_MISSING
+def test_binary_missing_explicit_path(fake_keys, fetch, tmp_path):
+    assert fetch({"keys_path": str(tmp_path / "no-such-keys")}).error_kind == ErrorKind.BINARY_MISSING
 
 
-def test_binary_missing_on_path(fake_keys, monkeypatch, tmp_path):
+def test_binary_missing_on_path(fake_keys, fetch, monkeypatch, tmp_path):
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     assert fetch().error_kind == ErrorKind.BINARY_MISSING
 
 
-def test_binary_not_executable(fake_keys):
+def test_binary_not_executable(fake_keys, fetch):
     fake_keys.path.chmod(0o644)
     assert fetch({"keys_path": str(fake_keys.path)}).error_kind == ErrorKind.BINARY_MISSING
 
 
-def test_explicit_keys_path_used(fake_keys, monkeypatch, tmp_path):
+def test_explicit_keys_path_used(fake_keys, fetch, monkeypatch, tmp_path):
     fake_keys.token_ok()
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     result = fetch({"keys_path": str(fake_keys.path)})
@@ -237,13 +267,13 @@ def test_explicit_keys_path_used(fake_keys, monkeypatch, tmp_path):
     assert result.binary_path == fake_keys.path
 
 
-def test_spawn_failure_is_binary_missing(fake_keys):
+def test_spawn_failure_is_binary_missing(fake_keys, fetch):
     fake_keys.path.write_text("#!/nonexistent/interpreter\n")
     fake_keys.path.chmod(0o755)
     assert fetch().error_kind == ErrorKind.BINARY_MISSING
 
 
-def test_child_env_is_allowlisted(fake_keys, monkeypatch):
+def test_child_env_is_allowlisted(fake_keys, fetch, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-real-should-not-leak")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-should-not-leak")
     monkeypatch.setenv("HERMES_HOME", "/tmp/should-not-leak")
@@ -253,25 +283,23 @@ def test_child_env_is_allowlisted(fake_keys, monkeypatch):
     (call,) = fake_keys.calls()
     allowed = {"PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "TMPDIR", "TEMP",
                "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "NO_COLOR"}
-    # /bin/sh and the Python interpreter may add a few of their own
-    # (PWD, SHLVL, _, __CF_USER_TEXT_ENCODING); none of them come from us.
+    # /bin/sh and the Python interpreter may add a few of their own.
     shell_added = {"PWD", "OLDPWD", "SHLVL", "_", "__CF_USER_TEXT_ENCODING"}
     child = set(call["env"]) - shell_added
     assert child <= allowed, child - allowed
     assert call["env"]["NO_COLOR"] == "1"
     assert call["env"]["HOME"] == str(fake_keys.home)
-    blob = json.dumps(call["env"])
-    assert "should-not-leak" not in blob
+    assert "should-not-leak" not in json.dumps(call["env"])
 
 
-def test_fetch_never_writes_environ(fake_keys):
+def test_fetch_never_writes_environ(fake_keys, fetch):
     fake_keys.token_ok()
     before = dict(os.environ)
     assert fetch().ok
     assert dict(os.environ) == before
 
 
-def test_fetch_never_raises_on_internal_bug(fake_keys, monkeypatch):
+def test_fetch_never_raises_on_internal_bug(fake_keys, fetch, monkeypatch):
     import keysrs_hermes.keysrs_source as mod
 
     def boom(cfg):
@@ -284,13 +312,12 @@ def test_fetch_never_raises_on_internal_bug(fake_keys, monkeypatch):
     assert TOKEN not in result.error
 
 
-def test_stdin_is_closed(fake_keys, tmp_path):
+def test_stdin_is_closed(fake_keys, fetch, tmp_path):
     # A helper that tries to read a prompt answer gets EOF at once.
     script = tmp_path / "bin" / "keys"
     script.write_text('#!/bin/sh\nread answer || exit 1\necho "got $answer"\n')
     script.chmod(0o755)
-    result = fetch({"helper_timeout_seconds": 3})
-    assert result.error_kind == ErrorKind.INTERNAL
+    assert fetch({"helper_timeout_seconds": 3}).error_kind == ErrorKind.INTERNAL
 
 
 def test_override_existing_default_true():
@@ -327,3 +354,15 @@ def test_remediation_points_at_setup():
         hint = src.remediation(kind, cfg)
         assert isinstance(hint, str) and "\n" not in hint
     assert src.remediation(None, cfg) == ""
+
+
+def test_config_reader_works_without_pyyaml(tmp_path, monkeypatch):
+    """Hermes 0.22.x ships ruamel.yaml, not PyYAML."""
+    pytest.importorskip("ruamel.yaml")
+    import sys
+
+    from keysrs_hermes.keysrs_source import read_hermes_config
+
+    write_config(tmp_path / "h", provider_cfg())
+    monkeypatch.setitem(sys.modules, "yaml", None)  # import yaml -> ImportError
+    assert read_hermes_config(tmp_path / "h")["providers"]["keysrs"]["key_env"] == "KEYSRS_TOKEN"

@@ -5,15 +5,21 @@ serves them through a local gateway (``http://127.0.0.1:12767/<key>``).
 The gateway accepts a scoped, expiring *client token* (``ksfc_...``) and
 swaps it for the real provider key on the way out.
 
-This source asks the ``keys`` CLI for the client token that was issued
-earlier with ``keys client issue ... --hold`` (one Touch ID, done by the
-user in ``hermes keysrs setup``) and hands Hermes two values:
+How Hermes is pointed at the gateway:
 
-* the gateway base URL, as the provider's base-URL env var
-* the client token, as the provider's API-key env var
+* ``hermes keysrs setup`` writes a named custom provider,
+  ``providers.<name>`` in config.yaml, whose ``base_url`` is the gateway
+  URL and whose ``key_env`` is ``KEYSRS_TOKEN``. The user selects it as
+  ``model.provider: custom:<name>``.
+* At startup this source asks ``keys client token`` for the held token and
+  fills only that ``key_env`` variable.
 
-So Hermes talks to the local gateway and the real provider key never
-enters the Hermes process.
+Why not ``OPENROUTER_API_KEY`` / ``OPENAI_API_KEY``: several Hermes paths
+(side-task clients, pricing, doctor) read those variables and send them to
+the vendor's real host regardless of any base-URL override. A
+``KEYSRS_*`` variable is read by nothing in Hermes except the custom
+provider entry that names it, and that entry always carries the gateway
+URL, so the token can only travel to loopback.
 
 Rules this module keeps (see ``agent.secret_sources.base``):
 
@@ -50,7 +56,20 @@ logger = logging.getLogger(__name__)
 
 SOURCE_NAME = "keysrs"
 DEFAULT_LABEL = "hermes"
-DEFAULT_PROVIDER = "openrouter"
+DEFAULT_PROVIDER_NAME = "keysrs"
+DEFAULT_KEY_ENV = "KEYSRS_TOKEN"
+# Every token variable must carry this prefix: no Hermes code reads a
+# KEYSRS_* name as a provider credential, so the only consumer is the
+# custom provider entry that names it.
+KEY_ENV_PREFIX = "KEYSRS_"
+DEFAULT_API_MODE = "chat_completions"
+# Narrowest gateway path each Hermes transport needs (relative to the
+# gateway base URL, which already ends in the provider's /v1 or /api/v1).
+API_MODE_PATH_PREFIX: Dict[str, str] = {
+    "chat_completions": "chat/completions",
+    "codex_responses": "responses",
+    "anthropic_messages": "messages",
+}
 # `keys` may have to launch the Keysrs app first (exit 6 if it cannot), so
 # leave room for a cold app start.
 DEFAULT_HELPER_TIMEOUT_SECONDS = 20.0
@@ -69,34 +88,28 @@ _TOKEN_SCRUB_RE = re.compile(r"ksfc_\S*")
 # nothing else: it reaches the Keysrs app through the user's HOME.
 KEYS_ALLOW_ENV: Tuple[str, ...] = ()
 
-# Provider presets: which env vars Hermes reads for that provider, the
-# Hermes provider id to select, and the narrowest gateway path prefix the
-# provider's Hermes transport needs.
-#   openrouter -> chat completions  (hermes_cli/providers.py: openai_chat)
-#   openai     -> Responses API     (hermes_cli/providers.py: codex_responses)
-PROVIDERS: Dict[str, Dict[str, str]] = {
-    "openrouter": {
-        "base_url": "OPENROUTER_BASE_URL",
-        "api_key": "OPENROUTER_API_KEY",
-        "hermes_provider": "openrouter",
-        "path_prefix": "chat/completions",
-    },
-    "openai": {
-        "base_url": "OPENAI_BASE_URL",
-        "api_key": "OPENAI_API_KEY",
-        "hermes_provider": "openai-api",
-        "path_prefix": "responses",
-    },
-}
-CUSTOM_PROVIDER = "custom"
-
 # Vault key names and labels go on the ``keys`` command line. Keep them to
 # a conservative charset so they can never parse as a flag.
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+# Hermes provider names: lowercase so `custom:<name>` matches exactly.
+_PROVIDER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 def valid_name(value: str) -> bool:
     return bool(_NAME_RE.match(value or ""))
+
+
+def valid_provider_name(value: str) -> bool:
+    return bool(_PROVIDER_NAME_RE.match(value or ""))
+
+
+def valid_key_env(value: str) -> bool:
+    return (
+        isinstance(value, str)
+        and is_valid_env_name(value)
+        and value.startswith(KEY_ENV_PREFIX)
+        and len(value) > len(KEY_ENV_PREFIX)
+    )
 
 
 def scrub(text: str, *, limit: int = 160) -> str:
@@ -104,6 +117,10 @@ def scrub(text: str, *, limit: int = 160) -> str:
     text = _TOKEN_SCRUB_RE.sub("ksfc_***", text or "")
     text = " ".join(text.split())
     return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def normalize_url(url: Any) -> str:
+    return str(url or "").strip().rstrip("/")
 
 
 # ---------------------------------------------------------------------------
@@ -134,54 +151,21 @@ def config_flag(value: Any, default: bool) -> bool:
     return default
 
 
+def _config_str(cfg: dict, key: str, default: str) -> str:
+    raw = _as_dict(cfg).get(key)
+    return raw.strip() if isinstance(raw, str) and raw.strip() else default
+
+
 def config_label(cfg: dict) -> str:
-    raw = _as_dict(cfg).get("label")
-    return str(raw).strip() if isinstance(raw, str) and raw.strip() else DEFAULT_LABEL
+    return _config_str(cfg, "label", DEFAULT_LABEL)
 
 
-def config_provider(cfg: dict) -> str:
-    raw = _as_dict(cfg).get("provider")
-    return str(raw).strip().lower() if isinstance(raw, str) and raw.strip() else DEFAULT_PROVIDER
+def config_provider_name(cfg: dict) -> str:
+    return _config_str(cfg, "provider_name", DEFAULT_PROVIDER_NAME).lower()
 
 
-def resolve_env_names(cfg: dict) -> Tuple[Optional[Tuple[str, str]], str]:
-    """Return ``((base_url_var, api_key_var), "")`` or ``(None, error)``.
-
-    ``base_url_var`` may be ``""`` for a custom map that only fills the
-    API key (the user then sets the gateway URL in config.yaml).
-    """
-    cfg = _as_dict(cfg)
-    provider = config_provider(cfg)
-    override = cfg.get("env")
-    if provider in PROVIDERS:
-        base_var = PROVIDERS[provider]["base_url"]
-        key_var = PROVIDERS[provider]["api_key"]
-    elif provider == CUSTOM_PROVIDER:
-        base_var, key_var = "", ""
-    else:
-        known = ", ".join([*PROVIDERS, CUSTOM_PROVIDER])
-        return None, f"secrets.keysrs.provider {provider!r} is not one of: {known}"
-
-    if override is not None:
-        if not isinstance(override, dict):
-            return None, "secrets.keysrs.env must be a mapping with base_url / api_key"
-        if "base_url" in override:
-            base_var = str(override.get("base_url") or "").strip()
-        if "api_key" in override:
-            key_var = str(override.get("api_key") or "").strip()
-
-    if not key_var:
-        return None, "secrets.keysrs.env.api_key is not set (custom provider needs both names)"
-    for var in (base_var, key_var):
-        if var and not is_valid_env_name(var):
-            return None, f"secrets.keysrs.env names an invalid env var: {var!r}"
-    if base_var and base_var == key_var:
-        return None, "secrets.keysrs.env.base_url and env.api_key must differ"
-    return (base_var, key_var), ""
-
-
-def _executable(path: Path) -> bool:
-    return path.is_file() and os.access(path, os.X_OK)
+def config_key_env(cfg: dict) -> str:
+    return _config_str(cfg, "key_env", DEFAULT_KEY_ENV)
 
 
 def resolve_keys_binary(cfg: dict) -> Optional[Path]:
@@ -198,6 +182,10 @@ def resolve_keys_binary(cfg: dict) -> Optional[Path]:
         return path if _executable(path) else None
     found = shutil.which("keys")
     return Path(found) if found else None
+
+
+def _executable(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
 
 
 def helper_timeout(cfg: dict) -> float:
@@ -242,6 +230,65 @@ def parse_expiry(value: Any) -> Optional[_dt.datetime]:
 
 def _now() -> _dt.datetime:
     return _dt.datetime.now(_dt.timezone.utc)
+
+
+def provider_entry_key_env(entry: Any) -> str:
+    entry = _as_dict(entry)
+    for field_name in ("key_env", "api_key_env", "keyEnv", "apiKeyEnv"):
+        raw = entry.get(field_name)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return ""
+
+
+def provider_entry_base_url(entry: Any) -> str:
+    entry = _as_dict(entry)
+    for field_name in ("base_url", "url", "api", "baseUrl"):
+        raw = entry.get(field_name)
+        if isinstance(raw, str) and raw.strip():
+            return normalize_url(raw)
+    return ""
+
+
+def read_hermes_config(home_path: Path) -> Optional[dict]:
+    """The profile's config.yaml (non-secret settings), or None if unreadable.
+
+    Read from ``home_path`` -- not the process-global HERMES_HOME -- so a
+    multiplexed profile checks its own provider entry.
+    """
+    try:
+        text = (Path(home_path) / "config.yaml").read_text(encoding="utf-8")
+        data = _safe_load_yaml(text)
+    except Exception:  # noqa: BLE001 - missing/unreadable config is a state, not a crash
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _safe_load_yaml(text: str) -> Any:
+    # Hermes 0.20.x ships PyYAML; 0.22.x ships ruamel.yaml instead.
+    try:
+        import yaml
+    except ImportError:
+        from ruamel.yaml import YAML
+
+        return YAML(typ="safe", pure=True).load(text)
+    return yaml.safe_load(text)
+
+
+def check_provider_entry(hermes_cfg: Optional[dict], provider_name: str, key_env: str) -> Tuple[str, str]:
+    """Return ``(provider_base_url, "")`` or ``("", problem)``."""
+    providers = _as_dict(_as_dict(hermes_cfg).get("providers"))
+    entry = providers.get(provider_name)
+    if not isinstance(entry, dict):
+        return "", f"providers.{provider_name} is missing from config.yaml"
+    if provider_entry_key_env(entry) != key_env:
+        return "", f"providers.{provider_name}.key_env is not {key_env}"
+    base_url = provider_entry_base_url(entry)
+    if not base_url:
+        return "", f"providers.{provider_name} has no base_url"
+    if not is_loopback_http_url(base_url):
+        return "", f"providers.{provider_name}.base_url is not the local Keysrs gateway"
+    return base_url, ""
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +466,8 @@ class KeysrsFetchResult(FetchResult):
 
 
 class KeysrsSource(SecretSource):
-    """Grant-mode credentials from Keysrs: gateway URL + scoped client token."""
+    """Grant-mode credentials from Keysrs: a scoped client token for a
+    custom provider whose base_url is the local gateway."""
 
     name = SOURCE_NAME
     label = "Keysrs"
@@ -436,13 +484,13 @@ class KeysrsSource(SecretSource):
                 "description": "Keysrs vault key the token was issued for (shown in status and hints only)",
                 "default": "",
             },
-            "provider": {
-                "description": "Which provider env vars to fill: openrouter | openai | custom",
-                "default": DEFAULT_PROVIDER,
+            "provider_name": {
+                "description": "Name of the custom provider entry (providers.<name>, used as custom:<name>)",
+                "default": DEFAULT_PROVIDER_NAME,
             },
-            "env": {
-                "description": "Override the env var names: {base_url: VAR, api_key: VAR}",
-                "default": {},
+            "key_env": {
+                "description": f"Env var the token goes into; must start with {KEY_ENV_PREFIX}",
+                "default": DEFAULT_KEY_ENV,
             },
             "keys_path": {
                 "description": "Absolute path to the keys CLI (default: keys on PATH)",
@@ -457,7 +505,7 @@ class KeysrsSource(SecretSource):
                 "default": DEFAULT_FETCH_TIMEOUT_SECONDS,
             },
             "override_existing": {
-                "description": "Gateway values replace provider vars already set in .env/shell",
+                "description": "Replace a stale token variable already set in the dotenv file or shell",
                 "default": True,
             },
         }
@@ -466,9 +514,8 @@ class KeysrsSource(SecretSource):
         return config_flag(_as_dict(cfg).get("enabled"), False)
 
     def override_existing(self, cfg: dict) -> bool:
-        # Default on: a real key left in the dotenv file must not be paired
-        # with the gateway URL (or win over the token). Same default as the
-        # bundled sources, which need it for rotation.
+        # Default on: a stale KEYSRS_TOKEN left in the dotenv file must not
+        # win over the fresh one. Same default as the bundled sources.
         return config_flag(_as_dict(cfg).get("override_existing"), True)
 
     def fetch_timeout_seconds(self, cfg: dict) -> float:
@@ -480,7 +527,7 @@ class KeysrsSource(SecretSource):
 
     def fetch(self, cfg: dict, home_path: Path) -> FetchResult:
         try:
-            result = self._fetch(_as_dict(cfg))
+            result = self._fetch(_as_dict(cfg), home_path)
         except Exception as exc:  # noqa: BLE001 - contract: never raise
             result = KeysrsFetchResult()
             result.error = f"unexpected error in Keysrs source ({type(exc).__name__})"
@@ -489,27 +536,40 @@ class KeysrsSource(SecretSource):
             logger.debug("keysrs fetch failed: %s", result.error_kind.value)
         return result
 
-    def _fetch(self, cfg: dict) -> KeysrsFetchResult:
+    def _fetch(self, cfg: dict, home_path: Path) -> KeysrsFetchResult:
         result = KeysrsFetchResult()
-        names, problem = resolve_env_names(cfg)
-        if names is None:
-            result.error = problem
-            result.error_kind = ErrorKind.REF_INVALID
+
+        def fail(kind: ErrorKind, message: str) -> KeysrsFetchResult:
+            result.error, result.error_kind = message, kind
+            result.secrets = {}
             return result
-        base_var, key_var = names
+
+        provider_name = config_provider_name(cfg)
+        key_env = config_key_env(cfg)
+        if not valid_provider_name(provider_name):
+            return fail(ErrorKind.REF_INVALID, f"secrets.keysrs.provider_name {scrub(provider_name, limit=40)!r} is not a valid provider name")
+        if not valid_key_env(key_env):
+            return fail(ErrorKind.REF_INVALID, f"secrets.keysrs.key_env must be an env var name starting with {KEY_ENV_PREFIX}")
+
+        # The token may only go into a variable whose one reader is a
+        # provider entry pointing at the local gateway.
+        provider_url, problem = check_provider_entry(read_hermes_config(home_path), provider_name, key_env)
+        if not provider_url:
+            return fail(ErrorKind.NOT_CONFIGURED, problem)
 
         lookup = lookup_token(cfg)
         result.binary_path = lookup.binary_path
         result.warnings.extend(lookup.warnings)
         if not lookup.ok:
-            result.error = lookup.error
-            result.error_kind = lookup.error_kind
-            return result
+            return fail(lookup.error_kind or ErrorKind.INTERNAL, lookup.error or "keys client token failed")
 
-        secrets = {key_var: lookup.token}
-        if base_var:
-            secrets[base_var] = str(lookup.meta["base_url"]).strip().rstrip("/")
-        result.secrets = secrets
+        if normalize_url(lookup.meta.get("base_url")) != provider_url:
+            return fail(
+                ErrorKind.NOT_CONFIGURED,
+                f"the held token is for a different gateway URL than providers.{provider_name}.base_url",
+            )
+
+        result.secrets = {key_env: lookup.token}
         return result
 
     def remediation(self, kind: Optional[ErrorKind], cfg: dict) -> str:
@@ -517,7 +577,7 @@ class KeysrsSource(SecretSource):
         key = cfg.get("key") if isinstance(cfg.get("key"), str) and cfg.get("key") else "<vault-key>"
         setup = f"hermes keysrs setup --key {key}"
         if kind == ErrorKind.NOT_CONFIGURED:
-            return f"Run `{setup}` to issue a held client token (one Touch ID)."
+            return f"Rerun `{setup}` (one Touch ID) to issue a held token and write the provider entry."
         if kind == ErrorKind.BINARY_MISSING:
             return "Install Keysrs, or set secrets.keysrs.keys_path to the absolute path of `keys`."
         if kind == ErrorKind.AUTH_EXPIRED:
@@ -528,7 +588,7 @@ class KeysrsSource(SecretSource):
         if kind == ErrorKind.NETWORK:
             return "Open the Keysrs app, then restart Hermes."
         if kind == ErrorKind.REF_INVALID:
-            return "Fix secrets.keysrs (provider / env / label) in config.yaml, or rerun setup."
+            return "Fix secrets.keysrs (provider_name / key_env / label) in config.yaml, or rerun setup."
         if kind == ErrorKind.EMPTY_VALUE:
             return f"Run `hermes keysrs status`; if it fails the same way, rerun `{setup}`."
         if kind == ErrorKind.INTERNAL:

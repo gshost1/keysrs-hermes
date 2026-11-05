@@ -68,7 +68,7 @@ def test_setup_issues_and_writes_only_non_secret_config(fake_keys, config, capsy
         "label": "hermes",
         "key": "openrouter",
         "provider": "openrouter",
-        "keys_path": str(fake_keys.path.resolve()),
+        "keys_path": str(fake_keys.path),
     }
     assert config["cfg"]["model"] == {"provider": "openrouter"}  # untouched
     out = capsys.readouterr().out
@@ -99,9 +99,96 @@ def test_setup_custom_scope(fake_keys, config):
 def test_setup_custom_env_names(fake_keys, config):
     issue_ok(fake_keys)
     fake_keys.token_ok()
-    assert run("setup", "--key", "k", "--provider", "custom",
+    assert run("setup", "--key", "k", "--provider", "custom", "--path-prefix", "v1/messages",
                "--base-url-env", "MY_URL", "--api-key-env", "MY_KEY") == 0
     assert config["cfg"]["secrets"]["keysrs"]["env"] == {"base_url": "MY_URL", "api_key": "MY_KEY"}
+    argv = fake_keys.calls()[0]["argv"]
+    assert argv[argv.index("--path-prefix") + 1] == "v1/messages"
+
+
+def test_setup_custom_needs_explicit_scope(fake_keys, config, capsys):
+    assert run("setup", "--key", "k", "--provider", "custom",
+               "--base-url-env", "MY_URL", "--api-key-env", "MY_KEY") == 64
+    assert "--path-prefix" in capsys.readouterr().err
+    assert fake_keys.calls() == [] and config["saves"] == 0
+
+
+def test_setup_custom_any_path_allowed(fake_keys, config):
+    issue_ok(fake_keys)
+    fake_keys.token_ok()
+    assert run("setup", "--key", "k", "--provider", "custom", "--any-path",
+               "--base-url-env", "MY_URL", "--api-key-env", "MY_KEY") == 0
+    assert "--path-prefix" not in fake_keys.calls()[0]["argv"]
+
+
+def test_rerun_keeps_env_override(fake_keys, config):
+    config["cfg"]["secrets"] = {"keysrs": {"enabled": True, "provider": "openrouter",
+                                           "env": {"api_key": "MY_OR_KEY"}}}
+    issue_ok(fake_keys)
+    fake_keys.token_ok()
+    assert run("setup", "--key", "openrouter") == 0
+    assert config["cfg"]["secrets"]["keysrs"]["env"] == {"api_key": "MY_OR_KEY"}
+
+
+def test_provider_change_drops_env_override(fake_keys, config):
+    config["cfg"]["secrets"] = {"keysrs": {"enabled": True, "provider": "openrouter",
+                                           "env": {"api_key": "MY_OR_KEY"}}}
+    issue_ok(fake_keys)
+    fake_keys.token_ok()
+    assert run("setup", "--key", "openai", "--provider", "openai") == 0
+    assert "env" not in config["cfg"]["secrets"]["keysrs"]
+
+
+def test_setup_tolerates_non_string_config(fake_keys, config):
+    config["cfg"]["secrets"] = {"keysrs": {"label": 2024, "provider": ["x"], "env": "junk"}}
+    issue_ok(fake_keys)
+    fake_keys.token_ok()
+    assert run("setup", "--key", "openrouter") == 0
+    section = config["cfg"]["secrets"]["keysrs"]
+    assert section["label"] == "hermes" and section["provider"] == "openrouter"
+
+
+def test_setup_notes_old_label(fake_keys, config, capsys):
+    config["cfg"]["secrets"] = {"keysrs": {"enabled": True, "label": "old"}}
+    issue_ok(fake_keys)
+    fake_keys.token_ok()
+    assert run("setup", "--key", "openrouter", "--label", "hermes") == 0
+    assert "label 'old' is still valid" in capsys.readouterr().out
+
+
+def test_setup_keeps_symlink_path(fake_keys, config, tmp_path, monkeypatch):
+    link_dir = tmp_path / "brew" / "bin"
+    link_dir.mkdir(parents=True)
+    (link_dir / "keys").symlink_to(fake_keys.path)
+    monkeypatch.setenv("PATH", f"{link_dir}:/usr/bin:/bin")
+    issue_ok(fake_keys)
+    fake_keys.token_ok()
+    assert run("setup", "--key", "openrouter") == 0
+    assert config["cfg"]["secrets"]["keysrs"]["keys_path"] == str(link_dir / "keys")
+
+
+def test_setup_prefers_path_over_stale_saved_path(fake_keys, config, tmp_path):
+    config["cfg"]["secrets"] = {"keysrs": {"keys_path": str(tmp_path / "gone" / "keys")}}
+    issue_ok(fake_keys)
+    fake_keys.token_ok()
+    assert run("setup", "--key", "openrouter") == 0
+    assert config["cfg"]["secrets"]["keysrs"]["keys_path"] == str(fake_keys.path)
+
+
+def test_setup_falls_back_to_saved_path(fake_keys, config, monkeypatch, tmp_path):
+    config["cfg"]["secrets"] = {"keysrs": {"keys_path": str(fake_keys.path)}}
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    issue_ok(fake_keys)
+    fake_keys.token_ok()
+    assert run("setup", "--key", "openrouter") == 0
+
+
+def test_setup_failure_shows_scrubbed_stderr(fake_keys, config, capsys):
+    from conftest import TOKEN
+    fake_keys.set("issue", exit=1, stderr=f"Touch ID cancelled near {TOKEN}\n")
+    assert run("setup", "--key", "openrouter") == 1
+    err = capsys.readouterr().err
+    assert "Touch ID cancelled" in err and TOKEN not in err
 
 
 def test_setup_custom_without_env_names_refused(fake_keys, config):
@@ -163,8 +250,16 @@ def test_setup_missing_binary(fake_keys, config, monkeypatch, tmp_path):
 def test_setup_reports_gateway_off_after_issue(fake_keys, config, capsys):
     issue_ok(fake_keys)
     fake_keys.token_ok(gateway_on=False)
-    assert run("setup", "--key", "openrouter") == 0
-    assert "keys gateway on openrouter" in capsys.readouterr().out
+    assert run("setup", "--key", "openrouter") == 1  # issued, but Hermes could not use it yet
+    out = capsys.readouterr().out
+    assert "check      FAILED" in out and "keys gateway on openrouter" in out
+    assert config["cfg"]["secrets"]["keysrs"]["enabled"] is True
+
+
+def test_status_odd_methods_do_not_crash(fake_keys, config, capsys):
+    fake_keys.token_ok(methods=[{"m": "POST"}, 3])
+    assert run("status") == 0
+    assert "methods" in capsys.readouterr().out
 
 
 def test_setup_child_env_allowlisted(fake_keys, config, monkeypatch):

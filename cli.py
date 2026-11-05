@@ -15,36 +15,37 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agent.secret_sources.base import run_secret_cli
+
 from .keysrs_source import (
     CUSTOM_PROVIDER,
-    DEFAULT_LABEL,
-    DEFAULT_PROVIDER,
+    KEYS_ALLOW_ENV,
     PROVIDERS,
     SOURCE_NAME,
     KeysrsSource,
+    _executable,
+    _now,
+    config_label,
+    config_provider,
     lookup_token,
     parse_expiry,
     resolve_env_names,
     resolve_keys_binary,
     scrub,
     valid_name,
-    _now,
 )
+from .keysrs_source import DEFAULT_LABEL, DEFAULT_PROVIDER
 
+# Long enough for the user to find the Keysrs window and touch the sensor.
 ISSUE_TIMEOUT_SECONDS = 180.0
 DEFAULT_DAYS = 7
 DEFAULT_METHODS = ("POST",)
-
-# Same base set run_secret_cli() gives a helper, so setup's child sees no
-# more of the Hermes environment than fetch()'s does.
-_BASE_ENV = ("PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "TMPDIR", "TEMP",
-             "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
 
 
 def _load_config() -> Dict[str, Any]:
@@ -65,12 +66,6 @@ def _section(cfg: Dict[str, Any]) -> Dict[str, Any]:
         return {}
     section = secrets.get(SOURCE_NAME)
     return section if isinstance(section, dict) else {}
-
-
-def _child_env() -> Dict[str, str]:
-    env = {k: os.environ[k] for k in _BASE_ENV if k in os.environ}
-    env["NO_COLOR"] = "1"
-    return env
 
 
 def _out(msg: str = "") -> None:
@@ -119,7 +114,10 @@ def setup_parser(parser: argparse.ArgumentParser) -> None:
     scope.add_argument(
         "--path-prefix",
         default=None,
-        help="Path prefix the token may call (default: the provider's chat endpoint)",
+        help=(
+            "Path prefix the token may call (default: chat/completions for openrouter, "
+            "responses for openai; required for custom unless --any-path)"
+        ),
     )
     scope.add_argument("--any-path", action="store_true", help="Do not restrict the path")
     s.add_argument("--keys-path", default=None, help="Absolute path to the keys CLI")
@@ -147,11 +145,6 @@ def dispatch(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _default_path_prefix(provider: str) -> Optional[str]:
-    preset = PROVIDERS.get(provider)
-    return preset["path_prefix"] if preset else None
-
-
 def build_issue_argv(
     binary: Path, key: str, label: str, days: int, methods: List[str], path_prefix: Optional[str]
 ) -> List[str]:
@@ -164,13 +157,28 @@ def build_issue_argv(
     return argv
 
 
+def _setup_binary(args: argparse.Namespace, current: Dict[str, Any]) -> Optional[Path]:
+    """--keys-path, else `keys` on PATH, else the path saved last time.
+
+    Kept absolute but not symlink-resolved, so a Homebrew-style
+    bin/keys -> Cellar/<version>/bin/keys link survives upgrades.
+    """
+    if args.keys_path:
+        path = Path(args.keys_path).expanduser().absolute()
+        return path if _executable(path) else None
+    found = shutil.which("keys")
+    if found:
+        return Path(found).absolute()
+    return resolve_keys_binary(current)
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     cfg = _load_config()
     current = _section(cfg)
 
     key = (args.key or "").strip()
-    label = (args.label or current.get("label") or DEFAULT_LABEL).strip()
-    provider = (args.provider or current.get("provider") or DEFAULT_PROVIDER).strip().lower()
+    label = (args.label or config_label(current)).strip()
+    provider = (args.provider or config_provider(current)).strip().lower()
     if not valid_name(key):
         _err(f"--key {key!r}: use letters, digits, '.', '_' or '-'")
         return 64
@@ -185,37 +193,40 @@ def cmd_setup(args: argparse.Namespace) -> int:
     if not methods or not all(m.isalpha() for m in methods):
         _err("--method must be an HTTP method name such as POST")
         return 64
-    path_prefix = None if args.any_path else (args.path_prefix or _default_path_prefix(provider))
-    if path_prefix is not None:
-        path_prefix = path_prefix.strip().lstrip("/") or None
-        if path_prefix and (path_prefix.startswith("-") or any(c.isspace() for c in path_prefix)):
+    if args.any_path:
+        path_prefix = None
+    elif args.path_prefix is not None:
+        path_prefix = args.path_prefix.strip().lstrip("/")
+        if not path_prefix or path_prefix.startswith("-") or any(c.isspace() for c in path_prefix):
             _err("--path-prefix must be a plain path such as chat/completions")
             return 64
+    elif provider in PROVIDERS:
+        path_prefix = PROVIDERS[provider]["path_prefix"]
+    else:
+        _err("--provider custom needs --path-prefix <path> (or --any-path to allow every path)")
+        return 64
 
     new_section: Dict[str, Any] = dict(current)
     new_section.update({"enabled": True, "label": label, "key": key, "provider": provider})
-    if provider == CUSTOM_PROVIDER or args.base_url_env or args.api_key_env:
-        env_map = dict(current.get("env") or {}) if isinstance(current.get("env"), dict) else {}
-        if args.base_url_env is not None:
-            env_map["base_url"] = args.base_url_env.strip()
-        if args.api_key_env is not None:
-            env_map["api_key"] = args.api_key_env.strip()
+    same_provider = config_provider(current) == provider
+    env_map = dict(current["env"]) if same_provider and isinstance(current.get("env"), dict) else {}
+    if args.base_url_env is not None:
+        env_map["base_url"] = args.base_url_env.strip()
+    if args.api_key_env is not None:
+        env_map["api_key"] = args.api_key_env.strip()
+    if env_map:
         new_section["env"] = env_map
-    elif provider in PROVIDERS:
+    else:
         new_section.pop("env", None)
     names, problem = resolve_env_names(new_section)
     if names is None:
         _err(problem)
         return 64
 
-    probe_cfg = dict(new_section)
-    if args.keys_path:
-        probe_cfg["keys_path"] = args.keys_path
-    binary = resolve_keys_binary(probe_cfg)
+    binary = _setup_binary(args, current)
     if binary is None:
         _err("Keysrs CLI `keys` not found. Install Keysrs or pass --keys-path /path/to/keys.")
         return 1
-    binary = binary.resolve()
     new_section["keys_path"] = str(binary)
 
     argv = build_issue_argv(binary, key, label, args.days, methods, path_prefix)
@@ -223,25 +234,18 @@ def cmd_setup(args: argparse.Namespace) -> int:
     _out(f"Issuing a Keysrs client token for key '{key}' (label '{label}', {args.days} days, {scope}).")
     _out("Approve with Touch ID in the Keysrs app...")
     try:
-        proc = subprocess.run(  # noqa: S603 - argv list, user at a terminal
-            argv,
-            env=_child_env(),
-            stdout=subprocess.PIPE,
-            stderr=None,  # let keys talk to the user directly
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=ISSUE_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired:
-        _err(f"keys client issue did not finish within {ISSUE_TIMEOUT_SECONDS:.0f}s; nothing was changed.")
-        return 1
-    except OSError as exc:
-        _err(f"could not run {binary}: {exc.strerror or exc}")
+        # Same allowlisted env and closed stdin as fetch(); Touch ID happens
+        # in the Keysrs app, not on this terminal.
+        proc = run_secret_cli(argv, allow_env=KEYS_ALLOW_ENV, timeout=ISSUE_TIMEOUT_SECONDS)
+    except RuntimeError as exc:
+        if isinstance(exc.__cause__, subprocess.TimeoutExpired):
+            _err(f"keys client issue did not finish within {ISSUE_TIMEOUT_SECONDS:.0f}s; nothing was changed.")
+        else:
+            _err(f"could not run keys: {scrub(str(exc))}")
         return 1
 
     if proc.returncode != 0:
-        _err(_issue_failure(proc.returncode, proc.stdout, key))
+        _err(_issue_failure(proc.returncode, proc.stdout, proc.stderr, key))
         return proc.returncode
 
     issued = _parse_issue(proc.stdout)
@@ -252,8 +256,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         _err("keys client issue did not report a held token (--hold); config not changed.")
         return 1
 
-    cfg.setdefault("secrets", {})
-    if not isinstance(cfg["secrets"], dict):
+    if not isinstance(cfg.get("secrets"), dict):
         cfg["secrets"] = {}
     cfg["secrets"][SOURCE_NAME] = new_section
     _save_config(cfg)
@@ -269,16 +272,20 @@ def cmd_setup(args: argparse.Namespace) -> int:
     hermes_provider = PROVIDERS.get(provider, {}).get("hermes_provider")
     if hermes_provider:
         _out(f"  Hermes reads these when the model provider is '{hermes_provider}'.")
+    old_label = config_label(current) if current else None
+    if old_label and old_label != label:
+        _out(f"  note       the held token for label '{old_label}' is still valid in Keysrs; "
+             "revoke it there if you no longer need it.")
 
     check = KeysrsSource().fetch(new_section, Path("."))
     if check.ok:
         _out("  check      ok: Hermes can fetch the token without a prompt")
-    else:
-        _out(f"  check      {check.error}")
-        hint = KeysrsSource().remediation(check.error_kind, new_section)
-        if hint:
-            _out(f"             {hint}")
-    return 0
+        return 0
+    _out(f"  check      FAILED: {check.error}")
+    hint = KeysrsSource().remediation(check.error_kind, new_section)
+    if hint:
+        _out(f"             {hint}")
+    return 1
 
 
 def _parse_issue(stdout: str) -> Optional[Dict[str, Any]]:
@@ -297,7 +304,7 @@ def _parse_issue(stdout: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _issue_failure(rc: int, stdout: str, key: str) -> str:
+def _issue_failure(rc: int, stdout: str, stderr: str, key: str) -> str:
     detail = ""
     for line in (stdout or "").splitlines():
         try:
@@ -307,6 +314,7 @@ def _issue_failure(rc: int, stdout: str, key: str) -> str:
         if isinstance(payload, dict) and isinstance(payload.get("error"), str):
             detail = payload["error"]
             break
+    detail = detail or (stderr or "").strip()
     if rc == 6:
         return "Keysrs app is not running and could not be launched. Open it and retry."
     if rc == 64:
@@ -330,9 +338,9 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     _out("Keysrs secret source")
     _out(f"  enabled    {'yes' if enabled else 'no'}")
-    _out(f"  label      {section.get('label') or DEFAULT_LABEL}")
+    _out(f"  label      {config_label(section)}")
     _out(f"  key        {section.get('key') or '(not recorded)'}")
-    _out(f"  provider   {section.get('provider') or DEFAULT_PROVIDER}")
+    _out(f"  provider   {config_provider(section)}")
     _out(f"  fills      {', '.join(v for v in names if v) if names else problem}")
     _out(f"  keys CLI   {binary or 'not found'}")
 
@@ -356,7 +364,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     else:
         _out(f"  expires    {meta.get('expires_at', '?')}")
     methods = meta.get("methods")
-    _out(f"  methods    {', '.join(methods) if isinstance(methods, list) and methods else 'any'}")
+    _out(f"  methods    {', '.join(str(m) for m in methods) if isinstance(methods, list) and methods else 'any'}")
     _out(f"  path       {meta.get('path_prefix') or 'any'}")
     for warning in lookup.warnings:
         _out(f"  warning    {warning}")

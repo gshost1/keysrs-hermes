@@ -51,8 +51,10 @@ logger = logging.getLogger(__name__)
 SOURCE_NAME = "keysrs"
 DEFAULT_LABEL = "hermes"
 DEFAULT_PROVIDER = "openrouter"
-DEFAULT_HELPER_TIMEOUT_SECONDS = 10.0
-DEFAULT_FETCH_TIMEOUT_SECONDS = 20.0
+# `keys` may have to launch the Keysrs app first (exit 6 if it cannot), so
+# leave room for a cold app start.
+DEFAULT_HELPER_TIMEOUT_SECONDS = 20.0
+DEFAULT_FETCH_TIMEOUT_SECONDS = 30.0
 EXPIRY_WARNING = _dt.timedelta(hours=24)
 
 TOKEN_PREFIX = "ksfc_"
@@ -113,6 +115,25 @@ def _as_dict(cfg: Any) -> dict:
     return cfg if isinstance(cfg, dict) else {}
 
 
+_TRUE = {"1", "true", "yes", "on"}
+_FALSE = {"0", "false", "no", "off", ""}
+
+
+def config_flag(value: Any, default: bool) -> bool:
+    """YAML booleans, plus the quoted spellings people write by hand."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE:
+            return True
+        if text in _FALSE:
+            return False
+    if isinstance(value, int):
+        return value != 0
+    return default
+
+
 def config_label(cfg: dict) -> str:
     raw = _as_dict(cfg).get("label")
     return str(raw).strip() if isinstance(raw, str) and raw.strip() else DEFAULT_LABEL
@@ -159,13 +180,22 @@ def resolve_env_names(cfg: dict) -> Tuple[Optional[Tuple[str, str]], str]:
     return (base_var, key_var), ""
 
 
+def _executable(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
+
+
 def resolve_keys_binary(cfg: dict) -> Optional[Path]:
-    """Explicit ``keys_path`` wins; otherwise ``keys`` on PATH."""
+    """Explicit ``keys_path`` wins; otherwise ``keys`` on PATH.
+
+    No PATH fallback when ``keys_path`` is set: startup should run exactly
+    the binary the user approved in setup, not whatever ``keys`` is first
+    on PATH that day.
+    """
     cfg = _as_dict(cfg)
     explicit = cfg.get("keys_path")
     if isinstance(explicit, str) and explicit.strip():
         path = Path(explicit.strip()).expanduser()
-        return path if path.is_file() and os.access(path, os.X_OK) else None
+        return path if _executable(path) else None
     found = shutil.which("keys")
     return Path(found) if found else None
 
@@ -432,11 +462,14 @@ class KeysrsSource(SecretSource):
             },
         }
 
+    def is_enabled(self, cfg: dict) -> bool:
+        return config_flag(_as_dict(cfg).get("enabled"), False)
+
     def override_existing(self, cfg: dict) -> bool:
-        # Default on: a real key left in .env must not be paired with the
-        # gateway URL (or win over the token). Same default as the bundled
-        # sources, which need it for rotation.
-        return bool(_as_dict(cfg).get("override_existing", True))
+        # Default on: a real key left in the dotenv file must not be paired
+        # with the gateway URL (or win over the token). Same default as the
+        # bundled sources, which need it for rotation.
+        return config_flag(_as_dict(cfg).get("override_existing"), True)
 
     def fetch_timeout_seconds(self, cfg: dict) -> float:
         try:

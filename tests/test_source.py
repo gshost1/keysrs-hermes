@@ -299,12 +299,22 @@ def test_override_existing_default_true():
     assert src.override_existing({"override_existing": False}) is False
 
 
+@pytest.mark.parametrize("value,expected", [
+    (True, True), (False, False), ("false", False), ("no", False), ("off", False), ("0", False),
+    ("true", True), ("YES", True), (1, True), (0, False), (None, None), ("maybe", None),
+])
+def test_flags_accept_quoted_spellings(value, expected):
+    src = KeysrsSource()
+    assert src.override_existing({"override_existing": value}) is (True if expected is None else expected)
+    assert src.is_enabled({"enabled": value}) is (False if expected is None else expected)
+
+
 def test_timeouts():
     src = KeysrsSource()
-    assert src.fetch_timeout_seconds({}) == 20.0
+    assert src.fetch_timeout_seconds({}) == 30.0
     assert src.fetch_timeout_seconds({"timeout_seconds": 5}) == 5.0
-    assert src.fetch_timeout_seconds({"timeout_seconds": "junk"}) == 20.0
-    assert src.fetch_timeout_seconds({"timeout_seconds": -1}) == 20.0
+    assert src.fetch_timeout_seconds({"timeout_seconds": "junk"}) == 30.0
+    assert src.fetch_timeout_seconds({"timeout_seconds": -1}) == 30.0
 
 
 def test_remediation_points_at_setup():

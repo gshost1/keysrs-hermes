@@ -49,6 +49,7 @@ from .keysrs_source import (
     parse_expiry,
     provider_entry_base_url,
     provider_entry_key_env,
+    read_hermes_config,
     resolve_keys_binary,
     scrub,
     valid_key_env,
@@ -215,9 +216,19 @@ def _setup_binary(args: argparse.Namespace, current: Dict[str, Any]) -> Optional
     return resolve_keys_binary(current)
 
 
-def _owned_by_keysrs(entry: Any, key_env: str) -> bool:
-    """An entry is ours when it reads our token variable."""
-    return isinstance(entry, dict) and provider_entry_key_env(entry) == key_env
+def _owned_by_keysrs(entry: Any) -> bool:
+    """An entry is ours when it reads a KEYSRS_* token variable."""
+    return isinstance(entry, dict) and valid_key_env(provider_entry_key_env(entry))
+
+
+def _saved_api_mode(entry: Any) -> Optional[str]:
+    if not isinstance(entry, dict):
+        return None
+    for field_name in ("api_mode", "transport"):
+        raw = entry.get(field_name)
+        if isinstance(raw, str) and raw.strip() in API_MODE_PATH_PREFIX:
+            return raw.strip()
+    return None
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
@@ -228,7 +239,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
     label = (args.label or config_label(current)).strip()
     provider_name = (args.provider_name or config_provider_name(current)).strip().lower()
     key_env = (args.key_env or config_key_env(current)).strip()
-    api_mode = args.api_mode or DEFAULT_API_MODE
+    existing = _providers(cfg).get(provider_name)
+    # A renewal (`setup --key K` again) keeps the wire protocol it had.
+    api_mode = args.api_mode or (_saved_api_mode(existing) if _owned_by_keysrs(existing) else None) or DEFAULT_API_MODE
     if not valid_name(key):
         _err(f"--key {key!r}: use letters, digits, '.', '_' or '-'")
         return 64
@@ -265,10 +278,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
         path_prefix = API_MODE_PATH_PREFIX[api_mode]
 
     # Refuse before spending a Touch ID: never take over someone else's entry.
-    existing = _providers(cfg).get(provider_name)
-    if existing is not None and not _owned_by_keysrs(existing, key_env):
-        _err(f"providers.{provider_name} already exists and does not read {key_env}; "
-             "not overwriting it. Pick another name with --provider-name.")
+    if existing is not None and not _owned_by_keysrs(existing):
+        _err(f"providers.{provider_name} already exists and is not a Keysrs entry (its key_env is not "
+             f"{KEY_ENV_PREFIX}*); not overwriting it. Pick another name with --provider-name.")
         return 1
 
     binary = _setup_binary(args, current)
@@ -310,11 +322,16 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # providers.<name>: update our own entry in place (keeps any extra
     # fields the user added, e.g. context_length), or create it.
     entry: Dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
-    for alias in ("api_key_env", "keyEnv", "apiKeyEnv", "url", "api", "baseUrl", "transport", "api_key"):
+    # Drop every alias Hermes might read instead of ours, plus `enabled:
+    # false` (rerunning setup is an explicit request to use it).
+    for alias in ("api_key_env", "keyEnv", "apiKeyEnv", "url", "api", "baseUrl", "transport",
+                  "api_key", "apiKey", "key_cmd", "enabled"):
         entry.pop(alias, None)
     entry.update({"base_url": base_url, "key_env": key_env, "api_mode": api_mode})
     if model_id:
         entry["default_model"] = model_id
+    elif current.get("key") != key:
+        entry.pop("default_model", None)  # a model id from another vault key would be wrong here
 
     section: Dict[str, Any] = {k: v for k, v in current.items() if k not in _LEGACY_SECTION_KEYS}
     section.update({
@@ -336,6 +353,15 @@ def cmd_setup(args: argparse.Namespace) -> int:
         cfg["providers"] = {}
     cfg["providers"][provider_name] = entry
     selector = f"custom:{provider_name}"
+    # Renaming the provider moves it: remove our old entry and follow it
+    # with model.provider, so no stale entry keeps reading the token.
+    old_name = config_provider_name(current) if current else None
+    moved_from = None
+    if old_name and old_name != provider_name and _owned_by_keysrs(cfg["providers"].get(old_name)):
+        cfg["providers"].pop(old_name)
+        moved_from = old_name
+        if _model_provider(cfg) == f"custom:{old_name}" and isinstance(cfg.get("model"), dict):
+            cfg["model"]["provider"] = selector
     if args.use:
         if not isinstance(cfg.get("model"), dict):
             cfg["model"] = {}
@@ -356,6 +382,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
         _out(f"  model      model.provider = {selector}" + (f", model.default = {model_id}" if model_id else ""))
     elif _model_provider(cfg) != selector:
         _out(f"  to use it  set `model.provider: {selector}` in config.yaml (or rerun with --use)")
+    if moved_from:
+        _out(f"  moved      removed providers.{moved_from} (was this plugin's entry)")
     old_label = config_label(current) if current else None
     if old_label and old_label != label:
         _out(f"  note       the held token for label '{old_label}' is still valid in Keysrs; "
@@ -436,7 +464,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     _out(f"  keys CLI   {binary or 'not found'}")
 
     rc = 0
-    provider_url, problem = check_provider_entry(cfg, provider_name, key_env)
+    # Same raw read fetch() does at startup, so status and startup agree.
+    raw_cfg = read_hermes_config(_hermes_home())
+    provider_url, problem = check_provider_entry(raw_cfg if raw_cfg is not None else cfg, provider_name, key_env)
     if not provider_url:
         _out(f"  provider   problem: {problem}")
         rc = 1

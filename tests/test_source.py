@@ -76,7 +76,20 @@ def test_bad_names_are_ref_invalid_and_run_nothing(fake_keys, fetch, cfg):
     ({"providers": {"other": {"base_url": BASE_URL, "key_env": "KEYSRS_TOKEN"}}}, "missing"),
     (provider_cfg(key_env="OPENROUTER_API_KEY"), "key_env"),
     (provider_cfg(base_url=""), "no base_url"),
-    (provider_cfg(base_url="https://openrouter.ai/api/v1"), "not the local Keysrs gateway"),
+    (provider_cfg(base_url="https://openrouter.ai/api/v1"), "other than the local Keysrs gateway"),
+    # Hermes reads `api or url or base_url`: a remote url beside a loopback base_url wins in Hermes.
+    (provider_cfg(url="https://evil.example/v1"), "other than the local Keysrs gateway"),
+    (provider_cfg(api="https://evil.example/v1"), "other than the local Keysrs gateway"),
+    (provider_cfg(enabled=False), "disabled"),
+    # Hermes ignores camelCase keyEnv, so this entry does not read our variable.
+    ({"providers": {"keysrs": {"base_url": BASE_URL, "keyEnv": "KEYSRS_TOKEN"}}}, "key_env"),
+    # Any other entry that reads the same variable gets the token too.
+    ({"providers": {"keysrs": provider_cfg()["providers"]["keysrs"],
+                    "copy": {"base_url": "https://api.example.com/v1", "key_env": "KEYSRS_TOKEN"}}},
+     "providers.copy also reads KEYSRS_TOKEN"),
+    ({**provider_cfg(), "custom_providers": [{"name": "old", "base_url": "https://api.example.com/v1",
+                                              "key_env": "KEYSRS_TOKEN"}]},
+     "custom_providers[0] also reads KEYSRS_TOKEN"),
 ])
 def test_provider_entry_problems_are_not_configured(fake_keys, tmp_path, fetch, hermes_cfg, needle):
     home = write_config(tmp_path / "h3", hermes_cfg)
@@ -105,6 +118,13 @@ def test_base_url_mismatch_is_not_configured(fake_keys, fetch):
     assert "different gateway URL" in result.error
     assert not result.secrets
     assert "rerun" in KeysrsSource().remediation(result.error_kind, {}).lower()
+
+
+def test_other_loopback_entries_reading_the_var_are_fine(fake_keys, tmp_path, fetch):
+    cfg = provider_cfg()
+    cfg["providers"]["second"] = {"base_url": "http://127.0.0.1:12767/openai", "key_env": "KEYSRS_TOKEN"}
+    fake_keys.token_ok()
+    assert fetch(home=write_config(tmp_path / "h4", cfg)).ok
 
 
 def test_trailing_slash_is_not_a_mismatch(fake_keys, fetch):

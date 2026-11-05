@@ -232,9 +232,16 @@ def _now() -> _dt.datetime:
     return _dt.datetime.now(_dt.timezone.utc)
 
 
+# Field precedence mirrors Hermes's own reader
+# (hermes_cli/runtime_provider.py _get_named_custom_provider):
+#   key_env or api_key_env;  api or url or base_url.
+_KEY_ENV_FIELDS = ("key_env", "api_key_env")
+_URL_FIELDS = ("api", "url", "base_url")
+
+
 def provider_entry_key_env(entry: Any) -> str:
     entry = _as_dict(entry)
-    for field_name in ("key_env", "api_key_env", "keyEnv", "apiKeyEnv"):
+    for field_name in _KEY_ENV_FIELDS:
         raw = entry.get(field_name)
         if isinstance(raw, str) and raw.strip():
             return raw.strip()
@@ -242,12 +249,32 @@ def provider_entry_key_env(entry: Any) -> str:
 
 
 def provider_entry_base_url(entry: Any) -> str:
+    """The URL Hermes will actually send to for this entry."""
     entry = _as_dict(entry)
-    for field_name in ("base_url", "url", "api", "baseUrl"):
+    for field_name in _URL_FIELDS:
         raw = entry.get(field_name)
         if isinstance(raw, str) and raw.strip():
             return normalize_url(raw)
     return ""
+
+
+def _entry_urls_all_loopback(entry: Any) -> bool:
+    entry = _as_dict(entry)
+    urls = [entry.get(f) for f in _URL_FIELDS if isinstance(entry.get(f), str) and entry.get(f).strip()]
+    return bool(urls) and all(is_loopback_http_url(normalize_url(u)) for u in urls)
+
+
+def _iter_provider_entries(hermes_cfg: Optional[dict]):
+    """(label, entry) for every providers: dict entry and legacy custom_providers item."""
+    cfg = _as_dict(hermes_cfg)
+    for name, entry in _as_dict(cfg.get("providers")).items():
+        if isinstance(entry, dict):
+            yield f"providers.{name}", entry
+    legacy = cfg.get("custom_providers")
+    if isinstance(legacy, list):
+        for i, entry in enumerate(legacy):
+            if isinstance(entry, dict):
+                yield f"custom_providers[{i}]", entry
 
 
 def read_hermes_config(home_path: Path) -> Optional[dict]:
@@ -276,18 +303,28 @@ def _safe_load_yaml(text: str) -> Any:
 
 
 def check_provider_entry(hermes_cfg: Optional[dict], provider_name: str, key_env: str) -> Tuple[str, str]:
-    """Return ``(provider_base_url, "")`` or ``("", problem)``."""
+    """Return ``(provider_base_url, "")`` or ``("", problem)``.
+
+    Also refuses when ANY provider entry that reads ``key_env`` could send
+    it off the machine -- filling the variable hands the token to every
+    such entry, not just ours.
+    """
     providers = _as_dict(_as_dict(hermes_cfg).get("providers"))
     entry = providers.get(provider_name)
     if not isinstance(entry, dict):
         return "", f"providers.{provider_name} is missing from config.yaml"
     if provider_entry_key_env(entry) != key_env:
         return "", f"providers.{provider_name}.key_env is not {key_env}"
+    if not config_flag(entry.get("enabled"), True):
+        return "", f"providers.{provider_name} is disabled (enabled: false)"
     base_url = provider_entry_base_url(entry)
     if not base_url:
         return "", f"providers.{provider_name} has no base_url"
-    if not is_loopback_http_url(base_url):
-        return "", f"providers.{provider_name}.base_url is not the local Keysrs gateway"
+    if not _entry_urls_all_loopback(entry):
+        return "", f"providers.{provider_name} points somewhere other than the local Keysrs gateway"
+    for where, other in _iter_provider_entries(hermes_cfg):
+        if provider_entry_key_env(other) == key_env and not _entry_urls_all_loopback(other):
+            return "", f"{where} also reads {key_env} but does not point at the local Keysrs gateway"
     return base_url, ""
 
 

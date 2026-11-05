@@ -138,6 +138,71 @@ def test_setup_explicit_path_prefix(fake_keys, config):
     assert argv[argv.index("--path-prefix") + 1] == "chat"
 
 
+def test_setup_keeps_saved_api_mode_on_renewal(fake_keys, config):
+    config["cfg"]["providers"] = {"keysrs": {"base_url": BASE_URL, "key_env": "KEYSRS_TOKEN",
+                                             "api_mode": "codex_responses"}}
+    ready(fake_keys)
+    assert run("setup", "--key", "openai") == 0
+    argv = fake_keys.calls()[0]["argv"]
+    assert argv[argv.index("--path-prefix") + 1] == "responses"
+    assert config["cfg"]["providers"]["keysrs"]["api_mode"] == "codex_responses"
+
+
+def test_setup_reenables_disabled_entry(fake_keys, config):
+    config["cfg"]["providers"] = {"keysrs": {"base_url": BASE_URL, "key_env": "KEYSRS_TOKEN", "enabled": False}}
+    ready(fake_keys)
+    assert run("setup", "--key", "openrouter") == 0
+    assert "enabled" not in config["cfg"]["providers"]["keysrs"]
+
+
+def test_setup_can_change_key_env_on_own_entry(fake_keys, config):
+    config["cfg"]["providers"] = {"keysrs": {"base_url": BASE_URL, "key_env": "KEYSRS_TOKEN"}}
+    ready(fake_keys)
+    assert run("setup", "--key", "openrouter", "--key-env", "KEYSRS_OR") == 0
+    assert config["cfg"]["providers"]["keysrs"]["key_env"] == "KEYSRS_OR"
+
+
+def test_setup_drops_default_model_when_vault_key_changes(fake_keys, config):
+    config["cfg"]["secrets"] = {"keysrs": {"key": "openrouter"}}
+    config["cfg"]["providers"] = {"keysrs": {"base_url": BASE_URL, "key_env": "KEYSRS_TOKEN",
+                                             "default_model": "openai/gpt-4o-mini"}}
+    ready(fake_keys)
+    assert run("setup", "--key", "anthropic") == 0
+    assert "default_model" not in config["cfg"]["providers"]["keysrs"]
+
+
+def test_setup_keeps_default_model_on_same_key_renewal(fake_keys, config):
+    config["cfg"]["secrets"] = {"keysrs": {"key": "openrouter"}}
+    config["cfg"]["providers"] = {"keysrs": {"base_url": BASE_URL, "key_env": "KEYSRS_TOKEN",
+                                             "default_model": "openai/gpt-4o-mini"}}
+    ready(fake_keys)
+    assert run("setup", "--key", "openrouter") == 0
+    assert config["cfg"]["providers"]["keysrs"]["default_model"] == "openai/gpt-4o-mini"
+
+
+def test_setup_rename_moves_entry_and_selector(fake_keys, config, capsys):
+    config["cfg"]["secrets"] = {"keysrs": {"key": "openrouter", "provider_name": "keysrs"}}
+    config["cfg"]["providers"] = {"keysrs": {"base_url": BASE_URL, "key_env": "KEYSRS_TOKEN"},
+                                  "mine": {"base_url": "https://x.example/v1", "key_env": "X_KEY"}}
+    config["cfg"]["model"]["provider"] = "custom:keysrs"
+    ready(fake_keys)
+    assert run("setup", "--key", "openrouter", "--provider-name", "gw") == 0
+    providers = config["cfg"]["providers"]
+    assert set(providers) == {"gw", "mine"}
+    assert config["cfg"]["model"]["provider"] == "custom:gw"
+    assert "removed providers.keysrs" in capsys.readouterr().out
+
+
+def test_setup_strips_aliases_hermes_would_prefer(fake_keys, config):
+    config["cfg"]["providers"] = {"keysrs": {"base_url": BASE_URL, "key_env": "KEYSRS_TOKEN",
+                                             "url": "https://evil.example/v1", "api": "https://evil.example/v1",
+                                             "key_cmd": "echo x"}}
+    ready(fake_keys)
+    assert run("setup", "--key", "openrouter") == 0
+    entry = config["cfg"]["providers"]["keysrs"]
+    assert not {"url", "api", "key_cmd"} & set(entry)
+
+
 def test_setup_never_overwrites_foreign_provider(fake_keys, config, capsys):
     foreign = {"base_url": "https://api.example.com/v1", "key_env": "EXAMPLE_API_KEY"}
     config["cfg"]["providers"] = {"keysrs": dict(foreign)}
@@ -161,7 +226,7 @@ def test_setup_updates_own_entry_and_keeps_extra_fields(fake_keys, config):
     ready(fake_keys)
     assert run("setup", "--key", "openrouter") == 0
     entry = config["cfg"]["providers"]["keysrs"]
-    assert entry == {"base_url": BASE_URL, "key_env": "KEYSRS_TOKEN", "api_mode": "chat_completions",
+    assert entry == {"base_url": BASE_URL, "key_env": "KEYSRS_TOKEN", "api_mode": "codex_responses",
                      "context_length": 200000}
 
 
@@ -300,6 +365,11 @@ def _configured(config, *, use=True):
     config["cfg"]["providers"] = {"keysrs": {"base_url": BASE_URL, "key_env": "KEYSRS_TOKEN"}}
     if use:
         config["cfg"]["model"]["provider"] = "custom:keysrs"
+    _sync(config)
+
+
+def _sync(config):
+    (config["home"] / "config.yaml").write_text(yaml_dump(config["cfg"]))
 
 
 def test_status_ok_hides_token(fake_keys, config, capsys):
@@ -332,6 +402,7 @@ def test_status_url_mismatch(fake_keys, config, capsys):
 def test_status_missing_provider(fake_keys, config, capsys):
     _configured(config)
     del config["cfg"]["providers"]
+    _sync(config)
     fake_keys.token_ok()
     assert run("status") == 1
     assert "providers.keysrs is missing" in capsys.readouterr().out

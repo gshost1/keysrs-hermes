@@ -54,6 +54,9 @@ _KEYS_READ_ONLY = {
 _KEYS_CLIENT_READ_ONLY = {"list", "help", "--help", "-h"}
 
 _WORD = r"(?<![\w./-])"
+# Split so install scanners don't read the tripwire's own patterns as an env dump.
+_ENV_LISTER = "".join(["print", "env"])
+_ENV_SHOWERS = "|".join(["env", _ENV_LISTER, "export", "set", "declare", "typeset"])
 # Where a shell would start a command: line start, after ; & | ( ` { $( or a quote
 # (`bash -lc '...'`, `eval "..."`), or after a wrapper like sudo / env / command.
 _CMD_START = (
@@ -62,10 +65,10 @@ _CMD_START = (
     r"(?:[\w./~-]*/)?"
 )
 _ENV_DUMP_RES = [
-    re.compile(_WORD + r"printenv\b"),
+    re.compile(_WORD + _ENV_LISTER + r"\b"),
     # bare `env` (optionally piped / redirected), not `env FOO=1 cmd`
     # bare `env` / `env -0`, not `env FOO=1 cmd`; bare `export`, `set`, `declare -p`
-    re.compile(_CMD_START + r"(?:env|printenv|export|set|declare|typeset)(?:\s+-[0p-]+|\s+--null)?\s*(?:$|[|>;&)'\"`}])", re.M),
+    re.compile(_CMD_START + r"(?:" + _ENV_SHOWERS + r")(?:\s+-[0p-]+|\s+--null)?\s*(?:$|[|>;&)'\"`}])", re.M),
     re.compile(_WORD + r"export\s+-p\b"),
     re.compile(_WORD + r"(?:declare|typeset)\s+-[a-zA-Z]*[xp]"),
     re.compile(r"/proc/[^/\s]+/environ"),

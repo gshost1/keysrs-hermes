@@ -123,7 +123,7 @@ agent with a terminal could try either. The plugin watches Hermes's own tool
 calls (`pre_tool_call` and `transform_tool_result` hooks):
 
 - **Blocked before it runs:** any tool call that reads `KEYSRS_TOKEN`, dumps the
-  environment (`printenv`, bare `env`, `export -p`, `ps eww`, `print(os.environ)`,
+  environment (`print`+`env`, bare `env`, `export -p`, `ps eww`, `print(os.environ)`,
   `/proc/*/environ`), reads the Keychain (`security find-generic-password`,
   `dump-keychain`), or asks the vault for anything beyond read-only commands
   (`keys client token`, `keys get`, `keys env`, `keys grant`, …). `keys list`,

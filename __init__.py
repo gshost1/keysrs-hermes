@@ -4,6 +4,7 @@ gateway with a scoped, expiring client token; the real key stays in Keysrs."""
 from __future__ import annotations
 
 from .cli import setup_parser
+from .hooks import classify_api_error
 from .keysrs_source import TOKEN_REDACTION_PATTERN, KeysrsSource
 
 
@@ -18,3 +19,6 @@ def register(ctx) -> None:
     register_patterns = getattr(ctx, "register_redaction_patterns", None)
     if callable(register_patterns):
         register_patterns([TOKEN_REDACTION_PATTERN])
+    register_hook = getattr(ctx, "register_hook", None)
+    if callable(register_hook):
+        register_hook("transform_api_error_classification", classify_api_error)

@@ -11,4 +11,4 @@ homepage: https://keysrs.com
 tags: [secrets, macos, keychain, gateway]
 requires_hermes: ">=0.20.4"
 provides_tools: []
-provides_hooks: []
+provides_hooks: [transform_api_error_classification]

@@ -1,0 +1,235 @@
+"""keysrs_keys / keysrs_request: the agent calls other APIs through the
+gateway; grants are asked once per scope and never reach the model."""
+
+from __future__ import annotations
+
+import http.server
+import json
+import threading
+
+import pytest
+
+import keysrs_hermes
+from conftest import provider_cfg, write_config
+from keysrs_hermes import access, tripwire
+
+GRANT = "ksf_" + "0a1b2c3d" + "_" + "GRANTSECRETvalue123"
+
+
+class Gateway(http.server.BaseHTTPRequestHandler):
+    calls: list = []
+    refuse = False
+    redirect = False
+
+    def _handle(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length).decode() if length else ""
+        Gateway.calls.append({"method": self.command, "path": self.path, "headers": dict(self.headers), "body": body})
+        if Gateway.redirect:
+            self.send_response(302)
+            self.send_header("Location", "https://evil.example/steal")
+            self.end_headers()
+            return
+        if Gateway.refuse:
+            self.send_response(403)
+            self.send_header("X-Keysrs-Source", "gateway")
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":"grant_expired"}')
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("X-Keysrs-Source", "upstream")
+        self.end_headers()
+        self.wfile.write(json.dumps({"login": "octocat", "echo": GRANT}).encode())
+
+    do_GET = do_POST = do_DELETE = do_PUT = do_PATCH = _handle
+
+    def log_message(self, *a):
+        pass
+
+
+@pytest.fixture
+def gateway():
+    Gateway.calls, Gateway.refuse, Gateway.redirect = [], False, False
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Gateway)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}/github"
+    server.shutdown()
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch, fake_keys):
+    cfg = provider_cfg()
+    cfg["secrets"] = {"keysrs": {"enabled": True, "key": "openrouter", "label": "hermes"}}
+    h = write_config(tmp_path / "hermes", cfg)
+    monkeypatch.setattr(access, "_hermes_home", lambda: h)
+    monkeypatch.setattr(tripwire, "_hermes_home", lambda: h)
+    access._reset_for_tests()
+    tripwire._reset_for_tests()
+    yield h
+    access._reset_for_tests()
+
+
+def grant_ok(fake_keys, base_url, **extra):
+    obj = {"id": "0a1b2c3d", "token": GRANT, "base_url": base_url, "auth_header": "Authorization",
+           "expires_at": "2099-01-01T00:00:00Z", "methods": ["GET"], "paths": ["/user"]}
+    obj.update(extra)
+    fake_keys.set("grant", stdout=json.dumps(obj) + "\n")
+
+
+def req(**kw):
+    kw.setdefault("key", "github")
+    kw.setdefault("method", "GET")
+    kw.setdefault("path", "/user")
+    kw.setdefault("task", "check my GitHub login")
+    return json.loads(access.keysrs_request(kw))
+
+
+def grant_calls(fake_keys):
+    return [c["argv"] for c in fake_keys.calls() if c["argv"][:1] == ["grant"]]
+
+
+def test_request_asks_once_then_reuses(home, fake_keys, gateway):
+    grant_ok(fake_keys, gateway)
+    first = req()
+    assert first["ok"] and first["status"] == 200
+    assert "octocat" in first["body"]
+    assert "approved" in first["note"]
+    second = req(path="/user")
+    assert second["ok"] and "note" not in second
+    (argv,) = grant_calls(fake_keys)
+    assert argv[:2] == ["grant", "github"]
+    assert argv[argv.index("--task") + 1] == "Hermes: check my GitHub login"
+    assert argv[argv.index("--methods") + 1] == "GET"
+    assert argv[argv.index("--paths") + 1] == "/user"
+    assert argv[-1] == "--json"
+    assert all(c["headers"].get("Authorization") == f"Bearer {GRANT}" for c in Gateway.calls)
+
+
+def test_grant_token_never_reaches_the_model(home, fake_keys, gateway):
+    grant_ok(fake_keys, gateway)
+    out = access.keysrs_request({"key": "github", "method": "GET", "path": "/user", "task": "t"})
+    assert GRANT not in out
+    assert "[Keysrs token hidden]" in out
+
+
+def test_new_method_or_path_asks_again(home, fake_keys, gateway):
+    grant_ok(fake_keys, gateway)
+    req()
+    req(method="POST", path="/user/repos", body={"name": "x"})
+    assert len(grant_calls(fake_keys)) == 2
+    assert json.loads(Gateway.calls[-1]["body"]) == {"name": "x"}
+
+
+def test_wide_scope_covers_subpaths(home, fake_keys, gateway):
+    grant_ok(fake_keys, gateway)
+    req(path="/repos/a/b/issues", scope="/repos")
+    req(path="/repos/c/d/pulls?state=open", scope="/repos")
+    assert len(grant_calls(fake_keys)) == 1
+    assert Gateway.calls[-1]["path"] == "/github/repos/c/d/pulls?state=open"
+
+
+def test_gateway_refusal_drops_grant(home, fake_keys, gateway):
+    grant_ok(fake_keys, gateway)
+    req()
+    Gateway.refuse = True
+    out = req()
+    assert out["status"] == 403 and "refused_by" in out
+    Gateway.refuse = False
+    req()
+    assert len(grant_calls(fake_keys)) == 2
+
+
+def test_agent_cannot_set_auth_headers(home, fake_keys, gateway):
+    grant_ok(fake_keys, gateway)
+    req(headers={"Authorization": "Bearer stolen", "X-Api-Key": "x", "Accept": "application/vnd.github+json", "Bad\nName": "v"})
+    sent = Gateway.calls[-1]["headers"]
+    assert sent["Authorization"] == f"Bearer {GRANT}"
+    assert "X-Api-Key" not in sent
+    assert sent["Accept"] == "application/vnd.github+json"
+
+
+def test_redirect_not_followed(home, fake_keys, gateway):
+    grant_ok(fake_keys, gateway)
+    Gateway.redirect = True
+    out = req()
+    assert out["status"] == 302
+    assert len(Gateway.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "kw,msg",
+    [
+        ({"key": "-rf"}, "vault key name"),
+        ({"key": "openrouter"}, "own model key"),
+        ({"method": "TRACE"}, "method"),
+        ({"path": "https://evil.example/x"}, "path"),
+        ({"path": "//evil.example/x"}, "path"),
+        ({"path": "/a/../../b"}, "path"),
+        ({"task": "  "}, "task"),
+        ({"path": "/user", "scope": "/repos"}, "not under"),
+    ],
+)
+def test_rejects_bad_args(home, fake_keys, kw, msg):
+    out = req(**kw)
+    assert not out["ok"] and msg in out["error"]
+    assert grant_calls(fake_keys) == []
+
+
+def test_allowlist(home, fake_keys, gateway):
+    cfg = provider_cfg()
+    cfg["secrets"] = {"keysrs": {"enabled": True, "key": "openrouter", "agent_keys": ["stripe"]}}
+    write_config(home, cfg)
+    out = req()
+    assert "not allowed" in out["error"]
+
+
+def test_access_off(home, fake_keys):
+    cfg = provider_cfg()
+    cfg["secrets"] = {"keysrs": {"enabled": True, "agent_access": False}}
+    write_config(home, cfg)
+    assert "turned off" in req()["error"]
+    assert access.available() is False
+
+
+def test_declined_grant(home, fake_keys):
+    fake_keys.set("grant", exit=1, stderr="presence check cancelled\n")
+    out = req()
+    assert not out["ok"] and "declined" in out["error"]
+
+
+def test_non_loopback_grant_url_refused(home, fake_keys):
+    grant_ok(fake_keys, "https://api.github.com")
+    out = req()
+    assert "not on this Mac" in out["error"]
+
+
+def test_keys_list(home, fake_keys):
+    rows = [
+        {"name": "github", "provider": "github", "host": "api.github.com", "kind": "runtime", "notes": "secret note"},
+        {"name": "stripe-live", "provider": "stripe", "host": "api.stripe.com", "kind": "billing"},
+        {"name": "BAD NAME", "provider": "x"},
+    ]
+    fake_keys.set("list", stdout=json.dumps(rows))
+    out = json.loads(access.keysrs_keys({}))
+    assert out["keys"] == [{"name": "github", "provider": "github", "host": "api.github.com"}]
+    assert "secret note" not in json.dumps(out)
+
+
+def test_tripwire_skips_own_tools(home):
+    assert tripwire.pre_tool_call(tool_name="keysrs_request", args={"task": "printenv keys get x"}) is None
+
+
+def test_registered():
+    tools = []
+
+    class Ctx:
+        def register_secret_source(self, s): pass
+        def register_cli_command(self, **k): pass
+        def register_tool(self, **k): tools.append(k)
+
+    keysrs_hermes.register(Ctx())
+    assert [t["name"] for t in tools] == ["keysrs_keys", "keysrs_request"]
+    assert all(t["toolset"] == "keysrs" and t["check_fn"] is access.available for t in tools)

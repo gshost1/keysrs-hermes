@@ -243,6 +243,8 @@ def read_log(home: Path, limit: int = 200) -> List[dict]:
 def pre_tool_call(tool_name: str = "", args: Any = None, **_: Any) -> Optional[Dict[str, str]]:
     """``pre_tool_call`` callback: block calls that reach for the credential."""
     try:
+        if str(tool_name).startswith("keysrs_"):
+            return None  # this plugin's own tools run no shell and hold the credential themselves
         cfg = _settings()
         if cfg is None:
             return None

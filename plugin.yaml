@@ -10,5 +10,5 @@ license: MIT
 homepage: https://keysrs.com
 tags: [secrets, macos, keychain, gateway]
 requires_hermes: ">=0.20.4"
-provides_tools: []
+provides_tools: [keysrs_keys, keysrs_request]
 provides_hooks: [transform_api_error_classification, pre_tool_call, transform_tool_result]

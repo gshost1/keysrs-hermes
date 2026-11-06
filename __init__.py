@@ -3,6 +3,7 @@ gateway with a scoped, expiring client token; the real key stays in Keysrs."""
 
 from __future__ import annotations
 
+from . import access
 from .cli import setup_parser
 from .commands import handle as keysrs_command
 from .hooks import classify_api_error
@@ -34,3 +35,4 @@ def register(ctx) -> None:
             description="Keysrs: token status and today's spend; `/keysrs revoke` cuts Hermes off",
             args_hint="[status|revoke|help]",
         )
+    access.register(ctx)

@@ -74,6 +74,8 @@ def test_plain_custom_provider_name_also_matches(enabled_home, fake_keys):
         {"status_code": 404, "error_body": {"error": {"message": "model not found"}}},
         {"status_code": 401, "error_body": {"error": {"message": "invalid api key"}}},
         {"status_code": 500, "error_body": GATEWAY_OFF_BODY},
+        {"provider": "custom", "status_code": 401, "error_body": {"error": "client_required"}},
+        {"provider": "custom", "status_code": 404, "error_body": {"message": "nothing with the gateway on"}},
     ],
 )
 def test_declines_everything_else(enabled_home, fake_keys, kw):
@@ -147,3 +149,13 @@ def test_hermes_classifier_uses_the_hook(enabled_home, fake_keys, monkeypatch):
     assert got.reason == error_classifier.FailoverReason.auth_permanent
     assert got.retryable is False
     assert "keys gateway on openrouter" in got.message
+
+
+def test_transient_lookup_failure_not_cached(enabled_home, fake_keys):
+    fake_keys.set("token", exit=6)
+    first = classify(status_code=404, error_body=GATEWAY_OFF_BODY)
+    assert "Open the Keysrs app" in first["message"]
+    fake_keys.token_ok(gateway_on=False)
+    second = classify(status_code=404, error_body=GATEWAY_OFF_BODY)
+    assert "keys gateway on openrouter" in second["message"]
+    assert len(fake_keys.calls()) == 2

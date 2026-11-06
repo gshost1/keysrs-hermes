@@ -40,6 +40,7 @@ from .keysrs_source import (
     _executable,
     _now,
     check_provider_entry,
+    config_flag,
     config_key_env,
     config_label,
     config_provider_name,
@@ -462,6 +463,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     in_use = current_model_provider == selector
     _out(f"  in use     {'yes' if in_use else 'no'} (model.provider = {current_model_provider or 'unset'})")
     _out(f"  keys CLI   {binary or 'not found'}")
+    _out(f"  tripwire   {_tripwire_summary(section)}")
 
     rc = 0
     # Same raw read fetch() does at startup, so status and startup agree.
@@ -502,6 +504,21 @@ def cmd_status(args: argparse.Namespace) -> int:
     if not in_use and rc == 0:
         _out(f"  hint       set `model.provider: {selector}` to send chat through the gateway")
     return rc
+
+
+def _tripwire_summary(section: Dict[str, Any]) -> str:
+    from .tripwire import read_log
+
+    if not config_flag(section.get("tripwire"), True):
+        return "off (secrets.keysrs.tripwire: false)"
+    events = read_log(_hermes_home())
+    blocked = sum(1 for e in events if e.get("event") == "blocked")
+    hidden = sum(1 for e in events if e.get("event") == "redacted")
+    text = f"on, {blocked} blocked, {hidden} hidden"
+    if events:
+        last = events[-1]
+        text += f" (last {last.get('at', '?')}: {last.get('tool', '?')} {last.get('rule', '')})"
+    return text
 
 
 def cmd_disable(args: argparse.Namespace) -> int:

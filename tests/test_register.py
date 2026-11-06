@@ -6,7 +6,7 @@ import argparse
 
 import keysrs_hermes
 from conftest import TOKEN
-from keysrs_hermes.keysrs_source import TOKEN_REDACTION_PATTERN, KeysrsSource
+from keysrs_hermes.keysrs_source import GRANT_REDACTION_PATTERN, TOKEN_REDACTION_PATTERN, KeysrsSource
 
 
 class FakeCtx:
@@ -35,7 +35,7 @@ def test_register():
     parser = argparse.ArgumentParser()
     cmd["setup_fn"](parser)
     assert parser.parse_args(["status"]).keysrs_command == "status"
-    assert ctx.patterns == [TOKEN_REDACTION_PATTERN]
+    assert ctx.patterns == [TOKEN_REDACTION_PATTERN, GRANT_REDACTION_PATTERN]
 
 
 def test_register_without_redaction_api():

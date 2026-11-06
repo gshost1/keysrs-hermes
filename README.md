@@ -73,7 +73,7 @@ model:
 | `hermes keysrs status` | Label, key, gateway URL, scope, expiry, whether the gateway has the key loaded, and whether `model.provider` uses it. Never shows the token. |
 | `hermes keysrs disable` | Stop fetching. The held token lives on in Keysrs until it expires or you revoke it. |
 | `/keysrs` (in a session, also from Telegram, Discord, …) | Token scope and time left, whether the gateway has the key loaded, today's calls and spend for the key, refusals, tripwire trips. Never shows the token. |
-| `/keysrs revoke` | Kill switch: revokes Hermes's held token now, no Touch ID. Every later call is refused at the gateway. Re-arming takes `hermes keysrs setup` on the Mac (Touch ID): a chat message can cut access off, never grant it. |
+| `/keysrs revoke` | Kill switch: revokes Hermes's held token and every grant the agent holds for other keys, now, no Touch ID. Every later call is refused at the gateway. Re-arming takes `hermes keysrs setup` on the Mac (Touch ID): a chat message can cut access off, never grant it. |
 
 ## How it works
 
@@ -117,6 +117,32 @@ would retry and try to refresh. The plugin registers a
 failures, so Hermes stops retrying, moves to your fallback chain if you set
 one, and logs the fix (`keys gateway on <key>` or `hermes keysrs setup`).
 
+## Let the agent use your other keys, without holding any
+
+Two agent tools (toolset `keysrs`):
+
+- `keysrs_keys` lists the vault's key names, providers and hosts. Never a value.
+- `keysrs_request` makes one HTTP call with one of those keys, through the
+  gateway. The first call for a key, method and path asks Keysrs for a
+  **grant**: a Touch ID prompt on your Mac whose task line starts with what
+  will actually run, then the agent's reason
+  ("Hermes POST /repos/me/app/issues: open an issue for the failing test").
+  Calls inside that scope then run without asking, for 15 minutes by default
+  (at most 60, at most 100 calls). A `DELETE` grant covers exactly one path.
+  Billing and signing keys are never available.
+
+The plugin keeps the grant token in memory and puts it on the request itself.
+The model sees the provider's answer and nothing else: no key, no grant
+token, and it cannot set auth headers or follow a redirect off the Mac.
+A grant dies with screen lock or a Keysrs restart; the gateway's refusal
+tells the agent to ask again. If you're away from the Mac, nobody touches the
+sensor and the call is refused after two minutes.
+
+Limit which keys the agent may ask for with
+`secrets.keysrs.agent_keys: [github, stripe-test]`, or turn the tools off with
+`secrets.keysrs.agent_access: false`. Hermes's own model key is never
+available to them.
+
 ## Leak tripwire
 
 The token lives in Hermes's process environment, and while it is live any
@@ -148,12 +174,16 @@ scoped, expiring token that works on this Mac. Turn it off with
   gateway refuses a call (to name the fix), and `keys client issue … --hold`
   during `hermes keysrs setup`; `/keysrs` runs `keys client token`,
   `keys spend --json` and `keys log --json`, and `/keysrs revoke` runs
-  `keys client revoke`. If the Keysrs app is not running, `keys`
+  `keys client revoke`; the agent tools run `keys list --json` and
+  `keys grant … --json`. If the Keysrs app is not running, `keys`
   opens it (it runs headless).
 - **User presence.** `setup` shows one Touch ID prompt from the Keysrs app.
-  `/keysrs revoke` needs none (revoking only removes access).
+  `/keysrs revoke` needs none (revoking only removes access). Each new
+  grant for `keysrs_request` shows one Touch ID prompt naming the task.
   Nothing else ever prompts.
-- **Network.** The plugin itself makes no network calls. Hermes's own provider
+- **Network.** The plugin's only network calls are `keysrs_request`'s, to the
+  loopback gateway (`http://127.0.0.1:12767/<key>/…`), which forwards them to
+  that key's provider. Hermes's own provider
   calls go to `http://127.0.0.1:12767/<key>` (the Keysrs gateway), which
   forwards them to the provider the key belongs to.
 - **Files.** `setup` and `disable` write `providers.<name>` and

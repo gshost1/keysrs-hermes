@@ -219,6 +219,23 @@ def revoke_text() -> str:
     cfg = _section()
     if not config_flag(cfg.get("enabled"), False):
         return "Keysrs is not set up for this Hermes; nothing to revoke."
+    grants_line = _revoke_grants(cfg)
+    return _revoke_client(cfg) + grants_line
+
+
+def _revoke_grants(cfg: dict) -> str:
+    from .access import revoke_all
+
+    revoked, failed = revoke_all(cfg)
+    if not revoked and not failed:
+        return ""
+    line = f"\nAlso revoked {revoked} agent grant(s) for other keys."
+    if failed:
+        line += f" ⚠️ {failed} could not be revoked; on the Mac run `keys revoke --all`."
+    return line
+
+
+def _revoke_client(cfg: dict) -> str:
     lookup = lookup_token(cfg)
     meta = lookup.meta
     client_id = meta.get("client_id")

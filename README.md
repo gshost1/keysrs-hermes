@@ -106,10 +106,19 @@ redaction pattern for `ksfc_` tokens with Hermes.
 None of these prompt or hang, so cron and the messaging gateway fail fast
 and say why.
 
+The same goes for a refusal in the middle of a session. If Keysrs restarts
+while Hermes is running, its gateway answers `404`, which Hermes would read as
+"model not found" and answer by switching models; a revoked or expired token
+answers `401`, which Hermes would keep retrying. The plugin registers a
+`transform_api_error_classification` hook that claims those two refusals for
+the Keysrs provider only, stops the retries, and names the fix
+(`keys gateway on <key>` or `hermes keysrs setup`).
+
 ## What this plugin does that you should know about (disclosures)
 
 - **Shell commands.** It runs the Keysrs CLI `keys`: `keys client token …`
-  at every Hermes startup and cron fire, and `keys client issue … --hold`
+  at every Hermes startup and cron fire, at most once per 30 seconds when the
+  gateway refuses a call (to name the fix), and `keys client issue … --hold`
   during `hermes keysrs setup`. If the Keysrs app is not running, `keys`
   opens it (it runs headless).
 - **User presence.** `setup` shows one Touch ID prompt from the Keysrs app.

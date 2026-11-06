@@ -72,6 +72,8 @@ model:
 | `hermes keysrs setup --key K [--days N] [--label L] [--path-prefix P \| --any-path] [--method M] [--use] [--model ID]` | Issue a held token (one Touch ID) and write the provider entry. Running it again replaces the old token. |
 | `hermes keysrs status` | Label, key, gateway URL, scope, expiry, whether the gateway has the key loaded, and whether `model.provider` uses it. Never shows the token. |
 | `hermes keysrs disable` | Stop fetching. The held token lives on in Keysrs until it expires or you revoke it. |
+| `/keysrs` (in a session, also from Telegram, Discord, …) | Token scope and time left, whether the gateway has the key loaded, today's calls and spend for the key, refusals, tripwire trips. Never shows the token. |
+| `/keysrs revoke` | Kill switch: revokes Hermes's held token now, no Touch ID. Every later call is refused at the gateway. Re-arming takes `hermes keysrs setup` on the Mac (Touch ID): a chat message can cut access off, never grant it. |
 
 ## How it works
 
@@ -144,9 +146,12 @@ scoped, expiring token that works on this Mac. Turn it off with
 - **Shell commands.** It runs the Keysrs CLI `keys`: `keys client token …`
   at every Hermes startup and cron fire, at most once per 30 seconds when the
   gateway refuses a call (to name the fix), and `keys client issue … --hold`
-  during `hermes keysrs setup`. If the Keysrs app is not running, `keys`
+  during `hermes keysrs setup`; `/keysrs` runs `keys client token`,
+  `keys spend --json` and `keys log --json`, and `/keysrs revoke` runs
+  `keys client revoke`. If the Keysrs app is not running, `keys`
   opens it (it runs headless).
 - **User presence.** `setup` shows one Touch ID prompt from the Keysrs app.
+  `/keysrs revoke` needs none (revoking only removes access).
   Nothing else ever prompts.
 - **Network.** The plugin itself makes no network calls. Hermes's own provider
   calls go to `http://127.0.0.1:12767/<key>` (the Keysrs gateway), which

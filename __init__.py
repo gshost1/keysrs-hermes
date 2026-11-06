@@ -4,6 +4,7 @@ gateway with a scoped, expiring client token; the real key stays in Keysrs."""
 from __future__ import annotations
 
 from .cli import setup_parser
+from .commands import handle as keysrs_command
 from .hooks import classify_api_error
 from .tripwire import pre_tool_call, transform_tool_result
 from .keysrs_source import TOKEN_REDACTION_PATTERN, KeysrsSource
@@ -25,3 +26,11 @@ def register(ctx) -> None:
         register_hook("transform_api_error_classification", classify_api_error)
         register_hook("pre_tool_call", pre_tool_call)
         register_hook("transform_tool_result", transform_tool_result)
+    register_command = getattr(ctx, "register_command", None)
+    if callable(register_command):
+        register_command(
+            "keysrs",
+            keysrs_command,
+            description="Keysrs: token status and today's spend; `/keysrs revoke` cuts Hermes off",
+            args_hint="[status|revoke|help]",
+        )

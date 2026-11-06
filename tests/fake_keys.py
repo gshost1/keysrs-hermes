@@ -25,6 +25,10 @@ def main() -> int:
         cmd = "token"
     elif argv[:2] == ["client", "issue"]:
         cmd = "issue"
+    elif argv[:2] == ["client", "revoke"]:
+        cmd = "revoke"
+    elif argv[:1] in (["spend"], ["log"]):
+        cmd = argv[0]
     else:
         print("fake keys: unsupported command", file=sys.stderr)
         return 64

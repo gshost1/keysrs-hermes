@@ -54,13 +54,20 @@ _KEYS_READ_ONLY = {
 _KEYS_CLIENT_READ_ONLY = {"list", "help", "--help", "-h"}
 
 _WORD = r"(?<![\w./-])"
-_CMD_START = r"(?:^|[;&|(`]\s*|\$\(\s*|\b(?:sudo|exec|xargs|command|nohup|time)\s+)"
+# Where a shell would start a command: line start, after ; & | ( ` { $( or a quote
+# (`bash -lc '...'`, `eval "..."`), or after a wrapper like sudo / env / command.
+_CMD_START = (
+    r"(?:^|[;&|(`{'\"]\s*|\$\(\s*"
+    r"|\b(?:sudo|exec|xargs|command|nohup|time|eval|nice|caffeinate)\s+(?:-\S+\s+(?:[^-\s]\S*\s+)?)*)"
+    r"(?:[\w./~-]*/)?"
+)
 _ENV_DUMP_RES = [
     re.compile(_WORD + r"printenv\b"),
     # bare `env` (optionally piped / redirected), not `env FOO=1 cmd`
-    re.compile(_CMD_START + r"env\s*(?:$|[|>;&)])", re.M),
+    # bare `env` / `env -0`, not `env FOO=1 cmd`; bare `export`, `set`, `declare -p`
+    re.compile(_CMD_START + r"(?:env|printenv|export|set|declare|typeset)(?:\s+-[0p-]+|\s+--null)?\s*(?:$|[|>;&)'\"`}])", re.M),
     re.compile(_WORD + r"export\s+-p\b"),
-    re.compile(_WORD + r"declare\s+-[a-zA-Z]*x"),
+    re.compile(_WORD + r"(?:declare|typeset)\s+-[a-zA-Z]*[xp]"),
     re.compile(r"/proc/[^/\s]+/environ"),
     # BSD `ps e...` / macOS `ps -E` print each process's environment; `ps -ef` does not.
     re.compile(_CMD_START + r"ps\s+(?:[a-zA-Z]*e[a-zA-Z]*\b|-[a-zA-Z]*E)", re.M),
@@ -73,7 +80,7 @@ _KEYCHAIN_RE = re.compile(
 # `keys <sub>` only where a shell would run it (line start, after ; && | ( ` $( sudo exec
 # xargs, or as an argv element), so prose like "API keys are stored" is not a command.
 _KEYS_CMD_RE = re.compile(
-    _CMD_START + r"(?:[\w./~-]*/)?keys\s+([A-Za-z-][\w-]*)(?:\s+([A-Za-z-][\w-]*))?", re.M
+    _CMD_START + r"keys\s+([A-Za-z-][\w-]*)(?:\s+([A-Za-z-][\w-]*))?", re.M
 )
 
 _lock = threading.Lock()
@@ -113,11 +120,22 @@ def _keys_rule(text: str) -> Optional[str]:
 
 
 def _argv_text(args: Any) -> List[str]:
-    """Tool args as text; a list of strings (an argv) is also joined as one command."""
+    """Tool args as text; every list of strings (an argv) is also joined as one command."""
     texts = list(_strings(args))
-    for value in _as_dict(args).values() if isinstance(args, dict) else []:
-        if isinstance(value, list) and value and all(isinstance(v, str) for v in value):
-            texts.append(" ".join(value))
+
+    def walk(value: Any, depth: int = 0) -> None:
+        if depth > 6:
+            return
+        if isinstance(value, (list, tuple)):
+            if value and all(isinstance(v, str) for v in value):
+                texts.append(" ".join(value))
+            for v in value:
+                walk(v, depth + 1)
+        elif isinstance(value, dict):
+            for v in value.values():
+                walk(v, depth + 1)
+
+    walk(args)
     return texts
 
 
@@ -139,24 +157,43 @@ def check_args(args: Any, key_env: str) -> Optional[str]:
     return None
 
 
+_warned: set = set()
+
+
+def _warn_once(what: str) -> None:
+    if what not in _warned:
+        _warned.add(what)
+        logger.warning("Keysrs tripwire is not running: %s", what)
+
+
+def tripwire_on(section: Any) -> bool:
+    section = _as_dict(section)
+    return config_flag(section.get("enabled"), False) and config_flag(section.get("tripwire"), True)
+
+
 def _settings() -> Optional[dict]:
     """secrets.keysrs when the plugin and the tripwire are on, else None.
 
     Re-read only when config.yaml changes: this runs on every tool call.
+    An unreadable config is not cached, so a read during a rewrite retries.
     """
-    path = _hermes_home() / "config.yaml"
     try:
+        path = _hermes_home() / "config.yaml"
         mtime = path.stat().st_mtime
-    except OSError:
+    except Exception as exc:  # noqa: BLE001 - ImportError, OSError
+        _warn_once(f"cannot read the Hermes config ({type(exc).__name__})")
         return None
     key = str(path)
     with _lock:
         hit = _cfg_cache.get(key)
         if hit and hit[0] == mtime:
             return hit[1]
-    section = _as_dict(_as_dict(_as_dict(read_hermes_config(path.parent)).get("secrets")).get("keysrs"))
-    on = config_flag(section.get("enabled"), False) and config_flag(section.get("tripwire"), True)
-    value = section if on else None
+    raw = read_hermes_config(path.parent)
+    if raw is None:
+        _warn_once("config.yaml did not parse")
+        return None
+    section = _as_dict(_as_dict(raw.get("secrets")).get("keysrs"))
+    value = section if tripwire_on(section) else None
     with _lock:
         _cfg_cache[key] = (mtime, value)
     return value
@@ -219,7 +256,7 @@ def pre_tool_call(tool_name: str = "", args: Any = None, **_: Any) -> Optional[D
             ),
         }
     except Exception as exc:  # noqa: BLE001 - never break tool dispatch
-        logger.debug("tripwire pre_tool_call failed: %s", type(exc).__name__)
+        _warn_once(f"pre_tool_call failed ({type(exc).__name__})")
         return None
 
 
@@ -229,7 +266,12 @@ def _live_tokens(cfg: dict) -> List[str]:
 
 
 def transform_tool_result(tool_name: str = "", result: Any = None, **_: Any) -> Optional[str]:
-    """``transform_tool_result`` callback: hide any token in tool output."""
+    """``transform_tool_result`` callback: hide any token in tool output.
+
+    Hermes hands this hook the final result string (JSON for structured
+    tools) and only accepts a string back, so scrubbing the string covers
+    structured results too.
+    """
     try:
         if not isinstance(result, str) or not result:
             return None
@@ -245,10 +287,11 @@ def transform_tool_result(tool_name: str = "", result: Any = None, **_: Any) -> 
         record("redacted", tool_name, "token in tool output")
         return cleaned
     except Exception as exc:  # noqa: BLE001 - never break tool dispatch
-        logger.debug("tripwire transform_tool_result failed: %s", type(exc).__name__)
+        _warn_once(f"transform_tool_result failed ({type(exc).__name__})")
         return None
 
 
 def _reset_for_tests() -> None:
     with _lock:
         _cfg_cache.clear()
+    _warned.clear()

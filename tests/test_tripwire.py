@@ -53,6 +53,20 @@ def term(cmd):
         "python3 -c 'import os; print(os.environ)'",
         "node -e 'console.log(process.env)'",
         f"curl -H 'Authorization: Bearer {TOKEN}' http://127.0.0.1:12767/x",
+        "bash -lc 'keys client token --label hermes --json'",
+        'sh -c "keys get openrouter"',
+        "eval 'keys env openrouter -- sh'",
+        "{ keys get x; }",
+        "sudo -u me keys get x",
+        "export",
+        "set",
+        "set | grep KEY",
+        "declare -p",
+        "typeset -x",
+        "/usr/bin/env",
+        "command env",
+        "env -0",
+        "bash -c 'env'",
     ],
 )
 def test_blocks(home, cmd):
@@ -64,6 +78,8 @@ def test_blocks(home, cmd):
 
 
 def test_blocks_argv_lists_and_code_tools(home):
+    assert tripwire.pre_tool_call(tool_name="exec", args=["keys", "get", "openrouter"])
+    assert tripwire.pre_tool_call(tool_name="exec", args={"spec": {"argv": ["keys", "client", "token"]}})
     assert tripwire.pre_tool_call(tool_name="exec", args={"argv": ["keys", "client", "token"]})
     assert tripwire.pre_tool_call(tool_name="execute_code", args={"code": "import os\nprint(os.environ)\n"})
     assert tripwire.pre_tool_call(tool_name="write_file", args={"path": "x.sh", "content": "echo $KEYSRS_TOKEN"})
@@ -90,6 +106,10 @@ def test_blocks_argv_lists_and_code_tools(home):
         "python -c 'import os, subprocess; subprocess.run([\"ls\"], env=os.environ.copy())'",
         "grep -rn ksfc_ docs/",
         "cat README.md",
+        "set -euo pipefail; make test",
+        "export PATH=$PATH:/opt/bin",
+        "keys grants --all",
+        "keys doctor",
     ],
 )
 def test_allows(home, cmd):
@@ -167,3 +187,15 @@ def test_hermes_dispatch_blocks(home, monkeypatch):
     action, message = plugins.get_pre_tool_call_directive("terminal", {"command": "keys client token --label hermes"})
     assert action == "block" and "Keysrs" in message
     assert plugins.get_pre_tool_call_directive("terminal", {"command": "ls"})[0] is None
+
+
+def test_unparseable_config_is_not_cached(home):
+    cfg_path = home / "config.yaml"
+    good = cfg_path.read_text()
+    cfg_path.write_text("{ not yaml")
+    assert term("printenv") is None
+    cfg_path.write_text(good)
+    import os as _os
+    st = cfg_path.stat()
+    _os.utime(cfg_path, (st.st_atime, st.st_mtime))
+    assert term("printenv") is not None

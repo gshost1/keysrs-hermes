@@ -507,14 +507,16 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def _tripwire_summary(section: Dict[str, Any]) -> str:
-    from .tripwire import read_log
+    from .tripwire import read_log, tripwire_on
 
-    if not config_flag(section.get("tripwire"), True):
-        return "off (secrets.keysrs.tripwire: false)"
+    if not tripwire_on(section):
+        if not config_flag(section.get("tripwire"), True):
+            return "off (secrets.keysrs.tripwire: false)"
+        return "off (the plugin is disabled)"
     events = read_log(_hermes_home())
     blocked = sum(1 for e in events if e.get("event") == "blocked")
     hidden = sum(1 for e in events if e.get("event") == "redacted")
-    text = f"on, {blocked} blocked, {hidden} hidden"
+    text = f"on; recent trips: {blocked} blocked, {hidden} hidden"
     if events:
         last = events[-1]
         text += f" (last {last.get('at', '?')}: {last.get('tool', '?')} {last.get('rule', '')})"

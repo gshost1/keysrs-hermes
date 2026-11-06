@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from .cli import setup_parser
 from .hooks import classify_api_error
+from .tripwire import pre_tool_call, transform_tool_result
 from .keysrs_source import TOKEN_REDACTION_PATTERN, KeysrsSource
 
 
@@ -22,3 +23,5 @@ def register(ctx) -> None:
     register_hook = getattr(ctx, "register_hook", None)
     if callable(register_hook):
         register_hook("transform_api_error_classification", classify_api_error)
+        register_hook("pre_tool_call", pre_tool_call)
+        register_hook("transform_tool_result", transform_tool_result)

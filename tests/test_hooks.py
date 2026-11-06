@@ -111,7 +111,7 @@ def test_registered_with_hermes():
         def register_hook(self, name, cb): calls.append((name, cb))
 
     keysrs_hermes.register(Ctx())
-    assert calls == [("transform_api_error_classification", hooks.classify_api_error)]
+    assert ("transform_api_error_classification", hooks.classify_api_error) in calls
 
 
 def _status_error(status: int, body: dict):

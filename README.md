@@ -115,6 +115,30 @@ would retry and try to refresh. The plugin registers a
 failures, so Hermes stops retrying, moves to your fallback chain if you set
 one, and logs the fix (`keys gateway on <key>` or `hermes keysrs setup`).
 
+## Leak tripwire
+
+The token lives in Hermes's process environment, and while it is live any
+process running as you can ask `keys client token` for it. A prompt-injected
+agent with a terminal could try either. The plugin watches Hermes's own tool
+calls (`pre_tool_call` and `transform_tool_result` hooks):
+
+- **Blocked before it runs:** any tool call that reads `KEYSRS_TOKEN`, dumps the
+  environment (`print`+`env`, bare `env`, `export -p`, `ps eww`, `print(os.environ)`,
+  `/proc/*/environ`), reads the Keychain (`security find-generic-password`,
+  `dump-keychain`), or asks the vault for anything beyond read-only commands
+  (`keys client token`, `keys get`, `keys env`, `keys grant`, …). `keys list`,
+  `keys log` and `keys spend` still work. The agent is told why, and that you
+  can run the command yourself.
+- **Hidden in output:** a `ksfc_` token that shows up in a tool result is
+  replaced with `[Keysrs token hidden]` before the model sees it.
+- **Logged:** every trip goes to `~/.hermes/keysrs/tripwire.jsonl` (time, tool,
+  rule; never the command or a secret) and shows in `hermes keysrs status`.
+
+It is a tripwire, not a sandbox: an agent that writes a script and runs it
+under another name can get past it. What it gets then is still only a
+scoped, expiring token that works on this Mac. Turn it off with
+`secrets.keysrs.tripwire: false`.
+
 ## What this plugin does that you should know about (disclosures)
 
 - **Shell commands.** It runs the Keysrs CLI `keys`: `keys client token …`
@@ -128,7 +152,8 @@ one, and logs the fix (`keys gateway on <key>` or `hermes keysrs setup`).
   calls go to `http://127.0.0.1:12767/<key>` (the Keysrs gateway), which
   forwards them to the provider the key belongs to.
 - **Files.** `setup` and `disable` write `providers.<name>` and
-  `secrets.keysrs` in Hermes's `config.yaml`, with no secrets. The plugin reads
+  `secrets.keysrs` in Hermes's `config.yaml`, with no secrets. The tripwire
+  appends to `<HERMES_HOME>/keysrs/tripwire.jsonl` (time, tool, rule only). The plugin reads
   no other files: no `.env`, no `auth.json`, no Keychain.
 - **Stored credentials.** None in Hermes. The token lives in Keysrs's own
   Keychain item (service `keysreallysafe.held`) and in Hermes's process
@@ -136,6 +161,9 @@ one, and logs the fix (`keys gateway on <key>` or `hermes keysrs setup`).
   as your user can ask `keys` for it without Touch ID. That is the price of
   unattended startup, so keep `--days` short and the scope narrow (the
   defaults are 7 days, `POST`, `chat/completions`).
+- **Hooks.** `transform_api_error_classification` (Keysrs gateway refusals),
+  `pre_tool_call` and `transform_tool_result` (the tripwire). All three fail
+  open: an error inside them never blocks Hermes.
 - **Telemetry.** None.
 - **Background processes.** None.
 

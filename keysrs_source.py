@@ -81,6 +81,9 @@ TOKEN_PREFIX = "ksfc_"
 # log line or transcript is masked. Literal prefix, no alternation, no
 # nested repeats (agent.redact rules).
 TOKEN_REDACTION_PATTERN = r"ksfc_[A-Za-z0-9._~+/=-]{4,}"
+# Keysrs task grants (keys grant): ksf_<8 hex id>_<base64url secret>.
+GRANT_REDACTION_PATTERN = r"ksf_[0-9a-f]{8}_[A-Za-z0-9_-]{4,}"
+REDACTED = "[Keysrs token hidden]"
 _TOKEN_SCRUB_RE = re.compile(r"ksfc_\S*")
 
 # Env vars the ``keys`` child gets on top of run_secret_cli()'s fixed base

@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .keysrs_source import (
+    GRANT_REDACTION_PATTERN,
+    REDACTED,
     TOKEN_REDACTION_PATTERN,
     _as_dict,
     config_flag,
@@ -40,8 +42,9 @@ from .keysrs_source import (
 
 logger = logging.getLogger(__name__)
 
-REDACTED = "[Keysrs token hidden]"
-_TOKEN_RE = re.compile(TOKEN_REDACTION_PATTERN)
+_TOKEN_RE = re.compile(f"{TOKEN_REDACTION_PATTERN}|{GRANT_REDACTION_PATTERN}")
+# This plugin's own tools: they run no shell and attach the credential themselves.
+OWN_TOOLS = frozenset({"keysrs_keys", "keysrs_request"})
 LOG_NAME = "tripwire.jsonl"
 _LOG_MAX_BYTES = 256 * 1024
 
@@ -243,8 +246,8 @@ def read_log(home: Path, limit: int = 200) -> List[dict]:
 def pre_tool_call(tool_name: str = "", args: Any = None, **_: Any) -> Optional[Dict[str, str]]:
     """``pre_tool_call`` callback: block calls that reach for the credential."""
     try:
-        if str(tool_name).startswith("keysrs_"):
-            return None  # this plugin's own tools run no shell and hold the credential themselves
+        if tool_name in OWN_TOOLS:
+            return None
         cfg = _settings()
         if cfg is None:
             return None
@@ -286,7 +289,7 @@ def transform_tool_result(tool_name: str = "", result: Any = None, **_: Any) -> 
         cleaned = result
         for token in _live_tokens(cfg):
             cleaned = cleaned.replace(token, REDACTED)
-        cleaned = _TOKEN_RE.sub(REDACTED, cleaned) if "ksfc_" in cleaned else cleaned
+        cleaned = _TOKEN_RE.sub(REDACTED, cleaned) if "ksf" in cleaned else cleaned
         if cleaned == result:
             return None
         record("redacted", tool_name, "token in tool output")

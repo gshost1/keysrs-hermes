@@ -73,7 +73,7 @@ model:
 | `hermes keysrs status` | Label, key, gateway URL, scope, expiry, whether the gateway has the key loaded, and whether `model.provider` uses it. Never shows the token. |
 | `hermes keysrs disable` | Stop fetching. The held token lives on in Keysrs until it expires or you revoke it. |
 | `/keysrs` (in a session, also from Telegram, Discord, …) | Token scope and time left, whether the gateway has the key loaded, today's calls and spend for the key, refusals, tripwire trips. Never shows the token. |
-| `/keysrs revoke` | Kill switch: revokes Hermes's held token now, no Touch ID. Every later call is refused at the gateway. Re-arming takes `hermes keysrs setup` on the Mac (Touch ID): a chat message can cut access off, never grant it. |
+| `/keysrs revoke` | Kill switch: revokes Hermes's held token and every grant the agent holds for other keys, now, no Touch ID. Every later call is refused at the gateway. Re-arming takes `hermes keysrs setup` on the Mac (Touch ID): a chat message can cut access off, never grant it. |
 
 ## How it works
 
@@ -124,9 +124,12 @@ Two agent tools (toolset `keysrs`):
 - `keysrs_keys` lists the vault's key names, providers and hosts. Never a value.
 - `keysrs_request` makes one HTTP call with one of those keys, through the
   gateway. The first call for a key, method and path asks Keysrs for a
-  **grant**: a Touch ID prompt on your Mac that shows the task Hermes gave
-  ("Hermes: open an issue for the failing test"). Calls inside that scope then
-  run without asking, for 15 minutes by default (at most 60, at most 100 calls).
+  **grant**: a Touch ID prompt on your Mac whose task line starts with what
+  will actually run, then the agent's reason
+  ("Hermes POST /repos/me/app/issues: open an issue for the failing test").
+  Calls inside that scope then run without asking, for 15 minutes by default
+  (at most 60, at most 100 calls). A `DELETE` grant covers exactly one path.
+  Billing and signing keys are never available.
 
 The plugin keeps the grant token in memory and puts it on the request itself.
 The model sees the provider's answer and nothing else: no key, no grant

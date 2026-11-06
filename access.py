@@ -31,7 +31,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.secret_sources.base import run_secret_cli
 
 from .keysrs_source import (
+    GRANT_REDACTION_PATTERN,
     KEYS_ALLOW_ENV,
+    REDACTED,
+    TOKEN_REDACTION_PATTERN,
     _as_dict,
     _now,
     config_flag,
@@ -58,9 +61,13 @@ METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 # Headers the agent may not set: credentials go on only from the held grant.
 _BLOCKED_HEADERS = {
     "authorization", "x-api-key", "x-goog-api-key", "api-key", "proxy-authorization",
-    "cookie", "host", "content-length", "x-ksf-token", "x-ksf-control", "x-ksf-client", "x-ksf-via",
+    "cookie", "host", "content-length", "transfer-encoding", "connection",
+    "x-http-method-override", "x-http-method", "x-method-override",
 }
-_GRANT_TOKEN_RE = re.compile(r"ksf_[0-9a-f]{8}_[A-Za-z0-9_-]+|ksfc_[A-Za-z0-9._~+/=-]{4,}")
+_BLOCKED_HEADER_PREFIXES = ("x-ksf-", "x-keysrs-", "proxy-")
+_GRANT_TOKEN_RE = re.compile(f"{GRANT_REDACTION_PATTERN}|{TOKEN_REDACTION_PATTERN}")
+# Keysrs refuses a task longer than this (Grants.swift GrantRequest.validated).
+_TASK_LIMIT = 120
 _PATH_RE = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$")
 
 
@@ -118,6 +125,13 @@ def _under(path: str, prefix: str) -> bool:
 
 _lock = threading.Lock()
 _grants: Dict[str, List[Grant]] = {}
+# One Touch ID prompt at a time per key: parallel tool calls wait for the first grant.
+_issue_locks: Dict[str, threading.Lock] = {}
+
+
+def _issue_lock(key: str) -> threading.Lock:
+    with _lock:
+        return _issue_locks.setdefault(key, threading.Lock())
 
 
 def _held(key: str, method: str, path: str) -> Optional[Grant]:
@@ -140,12 +154,71 @@ def _drop(grant: Grant) -> None:
         _grants[grant.key] = [g for g in _grants.get(grant.key, []) if g is not grant]
 
 
+def held_grants() -> List[Grant]:
+    with _lock:
+        return [g for gs in _grants.values() for g in gs]
+
+
+def revoke_all(cfg: dict) -> Tuple[int, int]:
+    """Revoke every grant this process holds (``keys revoke <id>``, no Touch ID).
+
+    Returns ``(revoked, failed)``. Held grants are forgotten either way.
+    """
+    with _lock:
+        grants = [g for gs in _grants.values() for g in gs]
+        _grants.clear()
+    if not grants:
+        return 0, 0
+    binary = resolve_keys_binary(cfg)
+    revoked = failed = 0
+    for g in grants:
+        if binary is None or not re.fullmatch(r"[0-9a-f]{8}", g.grant_id or ""):
+            failed += 1
+            continue
+        try:
+            proc = run_secret_cli([str(binary), "revoke", g.grant_id], allow_env=KEYS_ALLOW_ENV, timeout=helper_timeout(cfg))
+        except RuntimeError:
+            failed += 1
+            continue
+        if proc.returncode == 0:
+            revoked += 1
+        else:
+            failed += 1
+    return revoked, failed
+
+
+def _key_kind(cfg: dict, key: str) -> Optional[str]:
+    """The vault key's kind (runtime / billing / ...) or None if not found."""
+    binary = resolve_keys_binary(cfg)
+    if binary is None:
+        return None
+    try:
+        proc = run_secret_cli([str(binary), "list", "--json"], allow_env=KEYS_ALLOW_ENV, timeout=helper_timeout(cfg))
+        rows = json.loads(proc.stdout or "[]") if proc.returncode == 0 else []
+    except (RuntimeError, ValueError):
+        return None
+    for row in rows if isinstance(rows, list) else []:
+        if isinstance(row, dict) and row.get("name") == key:
+            return str(row.get("kind") or "runtime")
+    return None
+
+
 def _err(message: str, **extra: Any) -> str:
     return json.dumps({"ok": False, "error": message, **extra})
 
 
 def _redact(text: str) -> str:
-    return _GRANT_TOKEN_RE.sub("[Keysrs token hidden]", text)
+    return _GRANT_TOKEN_RE.sub(REDACTED, text)
+
+
+def prompt_task(method: str, scope: str, task: str) -> str:
+    """The Touch ID prompt's task line: the real method and scope first, so the
+    user approves what will run, not only the agent's own description of it."""
+    head = f"Hermes {method} {scope or '/'}: "
+    if len(head) >= _TASK_LIMIT - 8:
+        head = head[: _TASK_LIMIT - 9] + "…: "
+    room = _TASK_LIMIT - len(head)
+    return head + (task if len(task) <= room else task[: room - 1] + "…")
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +315,7 @@ def _issue(cfg: dict, key: str, method: str, scope: str, task: str, minutes: int
         return None, "Keysrs CLI not found"
     argv = [
         str(binary), "grant", key,
-        "--task", f"Hermes: {task}",
+        "--task", prompt_task(method, scope, task),
         "--minutes", str(minutes),
         "--methods", method,
         "--max-requests", str(MAX_REQUESTS),
@@ -286,7 +359,7 @@ def _send(grant: Grant, method: str, path: str, body: Any, headers: Dict[str, st
     if body is not None and method != "GET":
         if isinstance(body, (dict, list)):
             data = json.dumps(body).encode()
-            send_headers.setdefault("Content-Type", "application/json")
+            send_headers.setdefault("content-type", "application/json")
         else:
             data = str(body).encode()
     value = f"Bearer {grant.token}" if grant.auth_header.lower() == "authorization" else grant.token
@@ -336,6 +409,8 @@ def keysrs_request(args: Optional[dict] = None, **_: Any) -> str:
             return _err("`scope` must be a path prefix starting with /")
         if not _under(path.split("?", 1)[0], scope):
             return _err("`path` is not under `scope`")
+        if method == "DELETE" and scope != path.split("?", 1)[0]:
+            return _err("a DELETE grant covers exactly one path: leave `scope` unset")
         try:
             minutes = int(args.get("minutes") or DEFAULT_MINUTES)
         except (TypeError, ValueError):
@@ -345,18 +420,25 @@ def keysrs_request(args: Optional[dict] = None, **_: Any) -> str:
         for name, value in _as_dict(args.get("headers")).items():
             if not isinstance(name, str) or not isinstance(value, str):
                 continue
-            if name.lower() in _BLOCKED_HEADERS or not re.match(r"^[A-Za-z0-9-]{1,64}$", name) or any(c in value for c in "\r\n"):
+            low = name.lower()
+            if low in _BLOCKED_HEADERS or low.startswith(_BLOCKED_HEADER_PREFIXES) or not re.match(r"^[A-Za-z0-9-]{1,64}$", name) or any(c in value for c in "\r\n"):
                 continue
-            headers[name] = value[:1024]
+            headers[low] = value[:1024]
 
-        grant = _held(key, method, path.split("?", 1)[0])
         asked = False
-        if grant is None:
-            grant, problem = _issue(cfg, key, method, scope, task, minutes)
+        with _issue_lock(key):
+            grant = _held(key, method, path.split("?", 1)[0])
             if grant is None:
-                return _err(problem, key=key)
-            _keep(grant)
-            asked = True
+                kind = _key_kind(cfg, key)
+                if kind is None:
+                    return _err(f"no vault key {key!r}; call keysrs_keys for the names")
+                if kind != "runtime":
+                    return _err(f"{key!r} is a {kind} key, which agents may not use")
+                grant, problem = _issue(cfg, key, method, scope, task, minutes)
+                if grant is None:
+                    return _err(problem, key=key)
+                _keep(grant)
+                asked = True
             logger.warning("Keysrs: grant %s for %s %s %s (task: %s)", grant.grant_id, key, method, scope or "/", task)
 
         status, ctype, text, source = _send(grant, method, path, args.get("body"), headers)
@@ -404,3 +486,4 @@ def register(ctx) -> None:
 def _reset_for_tests() -> None:
     with _lock:
         _grants.clear()
+        _issue_locks.clear()

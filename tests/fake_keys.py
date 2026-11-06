@@ -27,6 +27,8 @@ def main() -> int:
         cmd = "issue"
     elif argv[:2] == ["client", "revoke"]:
         cmd = "revoke"
+    elif argv[:1] == ["revoke"]:
+        cmd = "grant_revoke"
     elif argv[:1] in (["spend"], ["log"], ["grant"], ["list"]):
         cmd = argv[0]
     else:

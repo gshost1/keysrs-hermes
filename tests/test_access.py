@@ -72,7 +72,14 @@ def home(tmp_path, monkeypatch, fake_keys):
     access._reset_for_tests()
 
 
+VAULT = [
+    {"name": "github", "provider": "github", "host": "api.github.com", "kind": "runtime"},
+    {"name": "stripe-live", "provider": "stripe", "host": "api.stripe.com", "kind": "billing"},
+]
+
+
 def grant_ok(fake_keys, base_url, **extra):
+    fake_keys.set("list", stdout=json.dumps(VAULT))
     obj = {"id": "0a1b2c3d", "token": GRANT, "base_url": base_url, "auth_header": "Authorization",
            "expires_at": "2099-01-01T00:00:00Z", "methods": ["GET"], "paths": ["/user"]}
     obj.update(extra)
@@ -101,7 +108,7 @@ def test_request_asks_once_then_reuses(home, fake_keys, gateway):
     assert second["ok"] and "note" not in second
     (argv,) = grant_calls(fake_keys)
     assert argv[:2] == ["grant", "github"]
-    assert argv[argv.index("--task") + 1] == "Hermes: check my GitHub login"
+    assert argv[argv.index("--task") + 1] == "Hermes GET /user: check my GitHub login"
     assert argv[argv.index("--methods") + 1] == "GET"
     assert argv[argv.index("--paths") + 1] == "/user"
     assert argv[-1] == "--json"
@@ -195,6 +202,7 @@ def test_access_off(home, fake_keys):
 
 
 def test_declined_grant(home, fake_keys):
+    fake_keys.set("list", stdout=json.dumps(VAULT))
     fake_keys.set("grant", exit=1, stderr="presence check cancelled\n")
     out = req()
     assert not out["ok"] and "declined" in out["error"]
@@ -218,7 +226,7 @@ def test_keys_list(home, fake_keys):
     assert "secret note" not in json.dumps(out)
 
 
-def test_tripwire_skips_own_tools(home):
+def test_tripwire_skips_own_tools(home):  # noqa: D103
     assert tripwire.pre_tool_call(tool_name="keysrs_request", args={"task": "printenv keys get x"}) is None
 
 
@@ -233,3 +241,75 @@ def test_registered():
     keysrs_hermes.register(Ctx())
     assert [t["name"] for t in tools] == ["keysrs_keys", "keysrs_request"]
     assert all(t["toolset"] == "keysrs" and t["check_fn"] is access.available for t in tools)
+
+
+def test_prompt_shows_real_method_and_scope_within_limit():
+    line = access.prompt_task("DELETE", "/repos/me/app", "list your repositories")
+    assert line.startswith("Hermes DELETE /repos/me/app: ")
+    long = access.prompt_task("POST", "/" + "a" * 200, "x" * 300)
+    assert len(long) <= 120 and long.startswith("Hermes POST /aaa")
+    assert len(access.prompt_task("GET", "/user", "y" * 500)) <= 120
+
+
+def test_billing_key_refused_even_by_name(home, fake_keys, gateway):
+    grant_ok(fake_keys, gateway)
+    out = req(key="stripe-live", path="/v1/refunds", method="POST")
+    assert "billing key" in out["error"]
+    assert grant_calls(fake_keys) == []
+
+
+def test_unknown_key(home, fake_keys, gateway):
+    grant_ok(fake_keys, gateway)
+    assert "no vault key" in req(key="nope")["error"]
+
+
+def test_delete_needs_exact_path(home, fake_keys, gateway):
+    grant_ok(fake_keys, gateway)
+    out = req(method="DELETE", path="/repos/me/app", scope="/")
+    assert "exactly one path" in out["error"]
+    assert req(method="DELETE", path="/repos/me/app")["ok"]
+
+
+def test_ksf_and_x_keysrs_headers_blocked(home, fake_keys, gateway):
+    grant_ok(fake_keys, gateway)
+    req(headers={"X-Keysrs-Key": "other", "X-Ksf-Grant": "x", "X-HTTP-Method-Override": "DELETE", "content-type": "application/vnd.api+json"}, method="POST", body={"a": 1})
+    sent = {k.lower(): v for k, v in Gateway.calls[-1]["headers"].items()}
+    assert "x-keysrs-key" not in sent and "x-ksf-grant" not in sent and "x-http-method-override" not in sent
+    assert sent["content-type"] == "application/vnd.api+json"
+
+
+def test_parallel_calls_ask_once(home, fake_keys, gateway):
+    grant_ok(fake_keys, gateway)
+    fake_keys.set("grant", stdout=fake_keys._scenario["grant"]["stdout"], sleep=0.5)
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(req())) for _ in range(3)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert all(r["ok"] for r in results)
+    assert len(grant_calls(fake_keys)) == 1
+
+
+def test_keysrs_revoke_also_revokes_agent_grants(home, fake_keys, gateway, monkeypatch):
+    import asyncio
+
+    from keysrs_hermes import commands
+
+    monkeypatch.setattr(commands, "_hermes_home", lambda: home)
+    grant_ok(fake_keys, gateway)
+    req()
+    fake_keys.token_ok()
+    fake_keys.set("revoke", stdout="ok\n")
+    fake_keys.set("grant_revoke", stdout="ok\n")
+    out = asyncio.run(commands.handle("revoke"))
+    assert "Also revoked 1 agent grant" in out
+    assert ["revoke", "0a1b2c3d"] in [c["argv"] for c in fake_keys.calls()]
+    assert access.held_grants() == []
+
+
+def test_tripwire_exempts_only_own_tools(home):
+    assert tripwire.pre_tool_call(tool_name="keysrs_shell", args={"cmd": "keys client token"}) is not None
+
+
+def test_tripwire_hides_grant_tokens(home):
+    out = tripwire.transform_tool_result(tool_name="terminal", result=f"token {GRANT} here")
+    assert GRANT not in out
